@@ -1,0 +1,4563 @@
+// ==UserScript==
+//  基于 QingJ/123pan_unlock v1.2.0（Apache-2.0）的社区修复版，原作者保留全部署名。
+//  本版改动（v1.2.2 → v1.2.7，2026-10 接口实测复修 + 移动端浏览器兼容）：
+//    1. 端点迁移：/v2/share/download/info、/v2/file/batch_download_share_info、/share/download-list、
+//       /share/get、/share/download/traffic/check（旧 /a/api/* 已 404）
+//    2. 响应形态：支持新版 dispatchList[].prefix + downloadPath，保留旧 DownloadUrl 兼容
+//    3. 「提取当前分享直链」改用 2026 真实载荷：
+//       share/get 必填 ShareKey/ParentFileId/Limit/OrderBy/OrderDirection/Next/Page（缺一个服务端报「请输入X」）；
+//       batch 载荷 fileIdList:[{FileID,S3keyFlag,Size,Etag,OrderId}]（键名大小写敏感，纯数字数组会报「fileIdList格式异常」）；
+//       失败且有 Etag 时退回 /v2/share/download/info。拿到直链即复制剪贴板并拉起浏览器下载（不转存、不写盘）。
+//    4. 新增「下载状态诊断」菜单：登录态（/api/share/visitor/info）+ 流量闸门原文
+//       （/api/share/download/traffic/check 的 isBlocked/cashierEnv/originalRemainTraffic）+ 直链可用性。
+//    5. 新增「打开登录入口」菜单：登录后走免费账号每月 10GB 提取流量。
+//    6. 接管 share/download/traffic/check 客户端闸门时保留 origIsBlocked 原始值，服务端最终结论照原样透出。
+//    7. 新版访客报告接口 restful/goapi/v1/share/report/info 的会员态回吐；调试入口 unsafeWindow.__pan123Fix（含 state）。
+//    8. （v1.2.3）「打开登录入口」兼容手机版布局：优先点 button/a，页面无登录节点时打开 https://www.123pan.com/login
+//       （实测 302 到 yun.123pan.cn/login）；未登录的取链失败提示里直接写明该菜单入口。
+//    9. （v1.2.4）「下载状态诊断」也写入文件清单（state.files 与诊断报告的 shareGet.files 不再为空）。
+//   10. （v1.2.5）遥测屏蔽规则改用「设计性中止」标记：仍用空响应顶掉 web_logs/metrics 请求，但不再往控制台刷 error 级日志。
+//   11. （v1.2.6）修掉「明明登录了却提示未登录」：站点登录态存在 localStorage.authorToken、
+//       以 Authorization: Bearer 发送（不在 cookie 里）。现在所有接口请求自动带该头，
+//       登录态判定也据此进行——登录后 batch_download_share_info 直接返回 dispatchList 真直链。
+//   12. （v1.2.7）移动端浏览器兼容（X 浏览器 / M 浏览器 / Via / 雨见浏览器·谷歌内核版）：
+//       原版对 GM_* 全是裸调用无守卫，手机端脚本引擎只实现部分 GM API 时
+//       GM_getValue（loadConfig 内）或 GM_registerMenuCommand（IIFE 顶层）任一缺失
+//       就会抛异常中止整个脚本 —— 这是「手机浏览器适配不够稳定」的真正原因。
+//       现在缺失的 API 才补等价实现（localStorage / execCommand / 同源 fetch），已有实现不动；
+//       补 @connect 白名单；下拉菜单在触屏上改为点按展开；设置面板内新增
+//       「提取当前分享直链」按钮（脚本菜单在手机端支持最不稳定）；window.open 被拦退同页跳转；
+//       toast 加安全区偏移；窄屏下两枚浮动按钮不再重叠。
+//   13. （v1.2.7）分享页直取直链：选中单个文件时右下角直接出现「提取该文件直链」按钮；
+//       提取码（SharePwd）与会话级登录令牌按站点真实口径读取；引擎的 GM_xmlhttpRequest
+//       存在但一调用就抛时自动降级同源 fetch，不再把 status 0 当成结果。
+//   14. （v1.2.8）修「无法获取直链 / 5113 分享方提取流量包不足」：
+//       根因是下载类接口缺 App 侧标识 platform=android —— 产物 rules 里本来就有这条，
+//       但它只挂在页面 fetch 的补丁上，而脚本自己走 GM_xmlhttpRequest，从未带上，
+//       服务端便按 web 侧应答、分享方的提取流量包闸门生效。gmRequest 补头后放行。
+//       另修：5113/5114 文案改用服务端原文；不再把文件夹当文件送去提取；
+//       目录里只有文件夹时自动下钻找第一个真文件；未登录提示不再误报给已登录用户。
+//   15. （v1.2.8）修「提取码不正确（当前读到 9999）」：提取码兜底读取原本会扫全页任意
+//       input 的 value，连别的浏览器扩展的隐藏字段（实测 #nopic-pf-maxW = 9999，
+//       图片最大宽高）都当成了提取码。现在只认**看得见**且**确实像提取码**的输入框
+//       （type=password，或 placeholder/aria-label/id/class 含提取码/密码/pwd），
+//       并排除本脚本自己的设置面板。
+//  已知服务端限制（2026-10 实测）：未登录访客提取分享文件必被服务端 5112「您需要注册登录或付费后下载」拒绝，
+//  官方免费通道只有登录（免费账号每月 10GB 提取流量）；看广告解锁通道对访客返回 adId:0（无广告），不可用。
+//  本脚本不绕过服务端闸门，也不伪造成交。
+// @name         123云盘解锁 修复版
+// @author       QingJ
+// @namespace    https://github.com/sjdidk/123pan
+// @upstream     https://greasyfork.org/zh-CN/scripts/563328
+// @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
+// @homepageURL  https://github.com/hawchou1995/123pan_unlock
+// @supportURL   https://qingju.me
+// @version      1.3.6
+// @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
+// @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
+// @contributor  hmjz100 - 借鉴了部分适配代码
+// @license      Apache Licence 2
+// @icon         data:image/x-icon;base64,AAABAAEAQEAAAAEAIAAoQgAAFgAAACgAAABAAAAAgAAAAAEAIAAAAAAAAEAAAMMOAADDDgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgC+3xYB/t8WBf7fFhQ+3xYkPt8WMD7fFji+3xY9Px9Wfr8fVn7+3xY+/x9Wfv7fFj7/H1Z+/t8WPv8fVn7/H1Z+/x9Wfv8fVn7/H1Z+/x9Wfv7fVn7+31Z+/t9Wfv7fVn7/H1Z+/x9Wfv8fVn7+3xY+/x9Wfv7fFj7/H1Z+/x9Wfv8fVn7/H1Z+/x9Wfv8fVn7/H1Z+/x9Wfr7fFj1+3xY5Pt8WMP7fFiU+3xYVPt8WBn7fFgI+3xYAvt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAD7fFgF+3xYJft8WIL7fFjV/H1Z8ft9Wff8fVn6+31Z/ft9Wf78fVn//H1Z//x9Wf/8fVn//H1Z//t9Wf/8fVn/+31Z//x9Wf/8fVn//H1Z//t9Wf/7fVn/+31Y//t9Wf/7fVn/+31Z//x9WP/8fVn/+31Z//x9Wf/7fVn//H1Z//t9Wf/8fVn/+31Z//x9Wf/8fVn//H1Z//t9Wf/8fVn/+31Z/vt9Wf38fVn7/H1Z9/x9WfL7fFjZ+3xYift8WCr7fFgG+3xYAft8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAH7fFgQ+3xYc/t8WNn8fVn1/H1Z/fx9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z/fx9Wfb7fFjd+3xYfPt8WBP7fFgC+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAL7fFgm+3xYrvt9We/7fVn9+31Z//t8Wf/7fFj/+3xY//t9Wf/7fVn/+31Z//t9Wf/7fFj/+3xY//t8Wf/7fVn/+31Z//t9Wf/7fFj/+3xY//t8Wf/7fVn/+31Z//t9Wf/7fVj/+3xY//t8WP/7fFj/+31Y//t9Wf/7fVn/+31Z//t8Wf/7fFj/+3xY//t9Wf/7fVn/+31Z//t8Wf/7fFj/+3xY//t9Wf/7fVn/+31Z//t9Wf/7fFj/+3xY//t8Wf/7fVn/+31Z/vt9WfD7fFi2+3xYLft8WAP7fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAL7fFgx+3xYxvt9Wff7fFj/+3xY//t8WP/7fVn/+3xY//t8WP/7fVj/+31Z//t9Wf/7fVj/+3xY//t8WP/7fVn/+3xY//t8WP/7fFj/+31Z//t9WP/7fFj/+3xY//t8WP/7fVj/+31Y//t8WP/7fFj/+3xY//t9WP/7fFj/+3xY//t8WP/7fVj/+31Y//t9Wf/7fFj/+3xY//t8WP/7fVn/+3xY//t8WP/7fVj/+31Z//t9Wf/7fVj/+3xY//t8WP/7fVn/+3xY//t8WP/7fFj/+31Z+ft8WMz7fFg5+3xYA/t8WAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAH7fFgp+3xYxvx9WPn8fVj//H1Y//x9Wf/8fVj//H1Y//x9WP/8fVn//H1Y//x9WP/8fVj//H1Z//x9WP/8fVj//H1Y//x9Wf/8fVj//H1Y//x9WP/8fVn//H1Y//x9WP/8fVj//H1Z//x9WP/8fVj//H1Y//x9WP/8fVn//H1Y//x9WP/8fVj//H1Z//x9WP/8fVj//H1Y//x9Wf/8fVj//H1Y//x9WP/8fVn//H1Y//x9WP/8fVj//H1Z//x9WP/8fVj//H1Y//x9Wf/8fVj//H1Y//x9WP/8fVn7+3xYzft8WDH7fFgC+3xYAAAAAAAAAAAAAAAAAPt8WAH7fFgT+3xYtfx9Wfj7fVj//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//t9WP/8fVn//H1Z//t9Wf/8fVn//H1Z//x9Wf/8fVn/+31Y//x9Wf/8fVn//H1Z//x9Wf/7fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn/+31Z//x9Wf/7fVj//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//t9WP/8fVn//H1Z//t9Wf/8fVn//H1Z//x9Wf/8fVn/+31Y//x9Wf/8fVn//H1Z//x9Wfn7fFi++3xYGft8WAEAAAAAAAAAAPt8WAD7fFgG+3xYgfx9WfD8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z8/t8WI/7fFgG+3xYAAAAAAD7fFgC+3xYMft8WOD8fFn+/HxZ//x8Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fFn//HxZ//x8Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fFn//HxZ//x8Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fFn//HxZ//x8Wf77fFjk+3xYPPt8WAMAAAAA+3xYB/t8WJb7fFj3+3xY//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFj/+3xZ//t8WP/7fFn/+3xZ//t8Wf/7fFn/+3xY//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFj/+3xZ//t8WP/7fFn/+3xZ//t8Wf/7fFn/+3xY//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFj/+3xY+Pt8WKT7fFgI+3xYAft8WCL7fFjg/HxY/vx8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP77fFnm+3xYLft8WAX7fFhj/HxY8/x8Wf/7fFj/+3xY//x8Wf/7fFj/+3xZ//x8WP/8fFj/+3xZ//x8Wf/8fFj//HxZ//x8Wf/8fFn//HxZ//x8WP/8fFn/+3xZ//x8WP/8fFn/+3xZ//t8WP/8fFj//HxY//t8WP/8fFj//HxY//x8WP/8fFj//HxZ//x8WP/8fFj//HxY//x8WP/7fFj//HxY//x8Wf/7fFj/+3xZ//x8WP/8fFj/+3xZ//x8Wf/8fFj//HxZ//x8Wf/8fFn//HxZ//x8WP/8fFn/+3xZ//x8WP/8fFn/+3xZ//t8WP/8fFj/+3xY//t8WP/8fFn//HxY9Pt8WHL7fFgJ+3xYovt8Wfn8fFn//HxZ//t8Wf/8fFn/+3xY//x8Wf/8fVn/+3xY//x8Wf/8fFn//H1Z//x8Wf/7fFn/+3xZ//t8Wf/7fFn//HxZ//x8Wf/7fFj//HxZ//x8Wf/7fFj//H1Y//x8Wf/8fFn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fFn/+3xZ//x8Wf/8fFn/+3xZ//t8Wf/8fFn/+3xY//x8Wf/8fVn/+3xY//x8Wf/8fFn//H1Z//x8Wf/7fFn/+3xZ//t8Wf/7fFn//HxZ//x8Wf/7fFj//HxZ//x8Wf/7fFj//H1Z//x8Wf/8fFn//HxZ//x9Wfr7fFix+3xYDPt8WND7fVj9+31Z//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVn/+31Y//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Y//t9WP/7fVn/+31Z//t9Wf/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVn/+31Y//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9Wf/7fVn++3xY3Pt8WBn7fFjo/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9WO37fFgm+3xY7/t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFjw+3xYLPx8WPD8fVn//H1Z//x9Wf/8fVj++3xZw/t8WK77fFit+3xYrft8WK37fFis/HxY2Px8WPr8fFj/+3xY3/t8WLb7fFis+3xYrft8WK37fFit+3xYrft8WK37fFit+3xYrft8WK37fFit+3xYrft8WK37fFit+3xYrft8WK37fFit+3xYrft8WKv7fFjC/HxY7/x9WP/8fFj//HxY5/t8WLb7fFis+3xYrft8WK37fFit+3xYrft8WK37fFit+3xYr/t8WLP7fFi8+3xYzPt8WOf7fFj//HxY//x8WP/8fVj//H1Y//x8WP/8fVj//H1Z//x9Wf/8fVn//HxY8ft8WCz7fVjw/H1Y//t9WP/7fVj//H1Y/Pt8WV77fFgn+3xYI/t8WCP7fFgj+3xYIvx9WZb8fVjx+31Y//t8WKn7fFg7+3xYIft8WCP7fFgj+3xYI/t8WCP7fFgj+3xYI/t8WCP7fFgj+3xYI/t8WCP7fFgj+3xYI/t8WCP7fFgj+3xYI/t8WCP7fFgf/HxYXvx9WNX8fVj//H1Y//t9WL/7fFg8+3xYIvt8WCP7fFgj+3xYI/t8WCP7fFgj+3xYI/t8WCT7fFgm+3xYKft8WC/7fFg6+3xYWPt8WJz7fFjs/H1Y//x9WP/7fVj//H1Y//t9WP/7fVj//H1Y//t9WPH7fFgs+31Y8Px9WP/7fVj//H1Y//t9WPv7fFhC+3xYBft8WAAAAAAAAAAAAPx9WAD8fViE+31Y7vx9WP/7fFia+3xYHPt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/HxYAPx8WET8fVjO/H1Y//t9WP/7fViz+3xYG/t8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADdfFgA/3xYAPp8WAT7fFge+3xYVPt8WMP7fFj++31Y//x9WP/8fVj/+31Y//x9Wf/8fVjx+3xYLPx9WfD8fVn//H1Z//x9Wf/8fVn7+3xYRPt8WAX7fFgAAAAAAAAAAAD7fVkA+31Zhfx9We/8fVn/+3xYm/t8WBz7fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPx8WQD8fFlE/H1Zzvx9Wf/8fVn//H1ZtPt8WBz7fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAb7fFhB+3xYyfx9Wf78fVn//H1Z//x9Wf/8fVn//H1Z8ft8WCz7fFjw+3xY//t8WP/7fFj/+3xY+/t8WET7fFgF+3xYAAAAAAAAAAAA/H1ZAPx9WYX7fFjv+3xY//t8WJv7fFgc+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8fFkA/HxZRPx8Wc77fFj/+3xY//t8WLP7fFgb+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYB/t8WFP7fFjz+3xY//t8WP/7fFj/+3xY//t8WPH7fFgs+3xY8Pt8WP/7fVj/+3xY//t8WPv7fFhE+3xZBft8WQAAAAAAAAAAAPx9WQD8fVmF+31Y7/t8WP/7fFib+3xYHPt8WAAAAAAAAAAAAPt9WAD7fVgR/H1ZLfx9WTb8fVk2/H1ZNvx9WTb8fVk2/H1ZNvx9WTb8fVk2/H1ZNvx9WTb8fVk2/H1ZMvx8WWv7fFjY+3xY//t8WP/7fFjE+3xYTPx9WTT8fVk2/H1ZNvx9WTb8fVk2/H1ZNvx9WTX7fFgw+3xYH/t8WAX7fFgAAAAAAAAAAAAAAAAA+3xYAPt8WAD7fFgX+3xYtft8WP37fFj/+31Y//t8WP/7fFjx+3xYLPx8WPD7fFj//HxY//x8WP/8fFj7+3xYRPt8WAX7fFgAAAAAAAAAAAD7fFgA+3xYhfx8WO/8fFj/+3xYm/t8WBz7fFgAAAAAAAAAAAD7fVkA+31ZQvx8WKr8fFjL/HxYyPx8WMj8fFjI/HxYyPx8WMj8fFjI/HxYyPx8WMj8fFjI/HxYyPx8WMf7fFjX/HxY9Px8WP/8fFj//HxY7/x8WM78fFjI/HxYyPx8WMj8fFjI/HxYyPx8WMj8fFjI/HxYxfx8WLz7fFib+3xYRvt8WAAAAAAAAAAAAAAAAAD7fFgA+3xYC/t8WHD8fFj8/HxY//x8WP/8fFj//HxY8ft8WCz8fFjw+3xY//x8WP/8fFj//HxY+/t8WET7fFkF+3xZAAAAAAAAAAAA/H1YAPx9WIX8fFjv/HxY//t8WJv7fFgc+3xYAAAAAAAAAAAA/H1ZAPx9WVf8fFjZ/HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj/+3xY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY+fx8WLf7fFgj+3xYAAAAAAAAAAAA+3xYAPt8WAX7fFhH/HxY+/x8WP/8fFj//HxY//x8WPH7fFgs+3xZ8Pt8Wf/7fFn/+3xZ//t8Wfv7fFlE+3xZBft8WQAAAAAAAAAAAPx9WQD8fVmF+3xZ7/t8Wf/7fFib+3xYHPt8WAAAAAAAAAAAAPt9WQD7fVlT+31Z2Pt9Wf/7fVn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+31Z//t9Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFnk+3xYXvt8WAAAAAAAAAAAAPt8WAD7fFgD+3xYOft8Wfv7fFn/+3xZ//t8Wf/7fFnx+3xYLPx8WfD8fFn//HxZ//x8Wf/8fVn7+3xZRPt8WQX7fFkAAAAAAAAAAAD8fFkA/HxZhfx9We/8fFn/+3xYoft8WB77fFgAAAAAAAAAAAD7fFgA+3xYSft8WdP8fFn//HxZ//x9Wf/8fVn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fVn//H1Z//x8Wf/8fFn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fFn//HxZ//x8Wf/8fFn//H1Z6vt8WHX7fFgAAAAAAAAAAAD7fFgA+3xYBft8WEL8fVn7/HxZ//x8Wf/8fFn//HxZ8ft8WCz7fFjw+3xY//t8WP/7fFj/+3xY+/t8WUT7fFkF+3xZAAAAAAAAAAAA/H1YAPx9WIX8fFjv+3xY//t8WLD7fFgj+3xYAAAAAAAAAAAA+3xYAPt8WCf7fFjB+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WOD7fFhL+3xYAAAAAAAAAAAA+3xYAPt8WAn7fFhi+3xY/Pt8WP/7fFj/+3xY//t8WPH7fFgs+3xY8Pt8Wf/7fFn/+3xY//t8WPv7fFlE+3xZBft8WQAAAAAAAAAAAPx9WQD8fVmF+3xZ7/t8Wf/7fFjM+3xYLPt8WAAAAAAAAAAAAPt8WAD7fFgF+3xYd/t8WOf7fFj/+3xZ//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFj/+3xY//t8Wf/7fFj/+3xY//t8WP/7fFn/+3xZ//t8WP/7fFj/+3xY//t8WP/7fFn/+3xZ//t8WP/7fFj/+3xY//t8WOn7fFiG+3xYEft8WAAAAAAAAAAAAPt8WAD7fFgT+3xYoft8WP37fFj/+3xZ//t8Wf/7fFjx+3xYLPx8WPD8fFj//HxY//x8WP/8fFj7+3xYRPt8WAX7fFgAAAAAAAAAAAD7fFgA+3xYhfx8WO/8fFj/+3xY8Pt8WD/7fFgA+3xYAAAAAAAAAAAA+3xYAPt8WBv7fFhn+3xYnPt8Waf7fFmn+3xYp/t8WKr7fFm1+3xYy/t8WO37fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/7fFj++3xY6ft8WMb7fFjI+3xZyPt8Wcj7fFjC+3xYsvt8WJL7fFhc+3xYG/t8WAAAAAAAAAAAAPt8WAD7fFgE+3xYOft8WOT8fFj+/HxY//x8WP/8fFj//HxY8ft8WCz7fFnw/HxZ//x8Wf/7fFn//HxZ+/t8WUT7fFkF+3xZAAAAAAAAAAAA+3xZAPt8WYX8fFnv/HxZ//x8Wf/7fFhy+3xYDvt8WAAAAAAAAAAAAAAAAAD7fFgA+3xYB/t8WBr7fVkl+31ZJft9WSX7fFgn+3xYMPt8WEL7fFhg+3xYlPx8WNz8fFj//HxZ//t8Wf/8fFn//HxZ//x8Wf/8fVn//HxZ/ft8WLP7fFg6+3xYQPt8WED7fFg/+3xYO/t8WC37fFgV+3xYAAAAAAAAAAAAAAAAAPt8WAD7fFYA+3xZHPt8Wab7fFn+/H1Z//t8Wf/8fFn//HxZ//t8WfH7fFgs/H1Z8Px9Wf/8fVn//H1Z//x9Wfv7fFlE+3xYBft8WAAAAAAAAAAAAPx9WQD8fVmF/H1Z7/x8Wf/8fVn/+3xYyft8WDD7fFgA+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WBX7fFhc+3xYxPx8Wf/7fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf37fFma/H1ZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgC+3xYJPt8WJD8fVn2/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVnx+3xYLPx9WfD8fVn//H1Z//x9Wf/8fVn7+3xYRPt8WQX7fFkAAAAAAAAAAAD8fFgA/HxYhfx9We/8fVn//H1Z//x9Wf37fFiQ+3xYGvt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYA/t8WFH7fFjQ/H1Z//x9Wf/8fVn//H1Z//x9WP/8fVn9/H1Zmvx9WQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYC/t8WGf7fFj3/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z8ft8WCz8fVnw/H1Z//x9Wf/8fVn//H1Z+/t8WET7fFkF+3xZAAAAAAAAAAAA/HxYAPx8WIX8fVnv/H1Z//x9Wf/8fVn/+3xY7vt8WIz7fFgs+3xYBft8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgK+3xYe/t8WPj8fVn//H1Z//x9Wf/8fFj//H1Z/fx9WZr8fVkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAj7fFhG+3xYr/x9WP78fVn//H1Z//x9Wf/8fVn//H1Z//x9WfH7fFgs+3xY8Pt8WP/7fFj/+3xY//t8Wfv7fFhE+3xYBft8WAAAAAAAAAAAAPt9WQD8fVmF+3xZ7/t8WP/7fFj/+3xZ//t8WP/7fFjz+3xYs/t8WHX7fFhS+3xYQPx8WDn8fFg3+3xYN/t8WDT7fFgi+3xYCft8WAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WEH7fFjK+3xZ//t8Wf/7fFn/+3xZ//t8Wf37fFin+3xYGvt8WCH7fFgh+3xYIft8WB37fFgR+3xYAft8WAAAAAAAAAAAAAAAAAD7fFgA+3xYBPt8WDL7fFjA+3xZ/vt8Wf/7fFn/+3xY//t8WP/7fFjx+3xYLPt8WPD7fFj/+3xY//t8WP/7fFj7+3xZRPt8WQX7fFkAAAAAAAAAAAD7fVgA+31Yhft9WO/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/8fFj3/H1Y3fx9WMj8fVi//H1Yvfx9WL38fFi5/HxYp/t8WHf7fFgp+3xYAPt8WAAAAAAAAAAAAPt8WAD7fFgZ+3xYmPt8WP/8fFj/+3xY//t8WP/7fFj+/H1Y2/x9WKH8fVik/H1YpPx9WKT8fVif/H1Ykvt8WHb7fFhI+3xYD/t8WAAAAAAAAAAAAPt8WAD7fFgH+3xYT/t8WO/7fFj/+3xY//t8WP/7fFj/+3xY8ft8WCz8fVjw/H1Y//x9WP/8fVj//H1Y+/t8WET7fFkF+3xZAAAAAAAAAAAA/H1ZAPx9WYX8fVnv/H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/7fVj2+3xYkft8WB37fFgAAAAAAAAAAAD7fFgA+ntXAvt8WHn7fFj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//t9WP/7fFj6+3xY0/t8WHT7fFgM+3xYAAAAAAAAAAAA+3xYAPt8WBb7fFi1/HxY/fx9WP/8fVj//H1Y//x9WPH7fFgs+31Z8Pt9Wf/7fVn/+31Z//t9Wfv7fFlE+3xYBft8WAAAAAAAAAAAAPx9WQD8fVmF+31Z7/t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wdn7fFhO+3xYAAAAAAAAAAAA+XpWAPt8WAD7fFhp+3xY//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fFjd+3xYQPt8WAAAAAAAAAAAAPt8WAD7fFgL+3xYcPt9Wfz7fVn/+31Z//t9Wf/7fVnx+3xYLPx9WfD8fVj//H1Z//x9Wf/8fVn7+3xZRPt8WQX7fFkAAAAAAAAAAAD7fFgA+3xYhfx9WO/8fVn//H1Z//x9Wf/8fVn//H1Z//x9WP/8fVj//H1Z//x9Wf/8fVn//H1Y//x9Wf/8fVn//H1Z//x9Wf/8fVno+3xYXPt8WAAAAAAAAAAAAAAAAAD7fFgA+3xYZPt8WPr8fVn//H1Z//x9WP/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Y6Pt8WGz7fFgAAAAAAAAAAAD7fFgA+3xYBvt8WEv8fVn7/H1Z//x9Wf/8fVj//H1Z8ft8WCz8fVnw/H1Z//x9Wf/8fVn//H1Z+/t8WET7fFgF+3xYAAAAAAAAAAAA/HxZAPx8WYX8fVnv/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn/+3xY0Pt8WEf7fFgAAAAAAAAAAAD7fFgA+3xYAPt8WGj7fFj+/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9WeL7fFhU+3xYAAAAAAAAAAAA+3xYAPt8WAT7fFhB/H1Z+/x9Wf/8fVn//H1Z//x9WfH7fFgs+31Y8Pt8WP/7fFj/+3xY//t8WPv7fFhE+3xYBft8WAAAAAAAAAAAAPx9WAD8fViF+3xY7/t8WP/7fFj/+3xY//t9WP/7fVj/+3xY//t8WP/7fVj/+31Y//t9WP/7fVj/+3xY//t8WP/7fFj/+3xY7vt8WIX7fFgZ+3xYAAAAAAAAAAAA+3xYAPp7WAP7fFh6+3xY//t8WP/7fFj/+31Y//t9WP/7fVj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WPf7fFit+3xYG/t8WAAAAAAAAAAAAPt8WAD7fFgH+3xYVPt8WPv7fFj/+3xY//t9WP/7fFjx+3xYLPx9WPD8fVj//H1Y//x9WP/8fVj7+3xYRPt8WAX7fFgAAAAAAAAAAAD7fFgA+3xYhfx9WO/8fVj//H1Y+/x9WMz8fVi8/H1Yvfx9WL38fVi9/H1Yvfx9WL38fVi9/H1Yvfx9WL38fVi6+3xYrft8WHj7fFgj+3xYAAAAAAAAAAAAAAAAAPt8WAD7fFgc/HxYnPx9WP/8fVj//H1Y7Px9WMX8fVi9/H1Yvfx9WL38fVi9/H1Yvfx9WL38fVi9/H1YvPx9WLX7fFiT+3xYOvt8WAAAAAAAAAAAAAAAAAD7fFgA+3xYDvt8WIP8fVj8/H1Y//x9WP/8fVj//H1Y8ft8WCz8fFjw+3xY//t8WP/8fFj/+3xY+/t8WET7fFkF+3xZAAAAAAAAAAAA/HxYAPx8WIX7fFjv+3xZ//x8WPP8fFhV+31YIvx9WCX8fVgl/H1YJfx9WCX8fVgl/H1YJfx9WCX8fFgk+3xYIPt8WAv7fFgAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgA+3xYRvt8WND7fFj/+3xY//t8WL/7fFg9/H1YI/x9WCX8fVgl/H1YJfx9WCX8fVgl+31YJfx8WCL7fFgX+3xYA/t8WAAAAAAAAAAAAAAAAAD7fFgA+3xYAPt8WCD7fFjJ+3xY/vx8WP/7fFj/+3xY//x8WPH7fFgs+3xY8Pt8Wf/7fFj/+3xY//t8WPv7fFhE+3xYBft8WAAAAAAAAAAAAPx9WQD8fVmF+3xY7/t8Wf/8fFjx/HxYOPx8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYEvt8WIn7fFj9+3xY//t8WP/7fFiz+3xYG/t8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAv7fFho+3xY+vt8WP/7fFj/+3xY//t8Wf/7fFjx+3xYLPx8WfD8fFn//HxZ//x8Wf/8fFn7+3xZRPt8WQX7fFkAAAAAAAAAAAD7fFgA+3xYhfx8We/8fFn//HxY8vx8WDj8fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYDft8WGj8fFnc/HxZ//x8Wf/8fFn//HxZtPt8WBz7fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAf7fFhL+3xY2fx8Wf78fFn//HxZ//x8Wf/8fFn//HxZ8ft8WCz8fVnw/H1Z//x9Wf/8fVn//H1Z+/t8WUL7fFkE+3xZAAAAAAAAAAAA/HxYAPx8WIT8fVnu/H1Z//x8WPH8fFg4/HxYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgI+3xYI/t8WG/7fFjW/H1Z//x9Wf/8fVn//H1Z//x9WbP7fFgb+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYA/t8WBz7fFhX+3xYzfx9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9WfH7fFgs+3xY8Pt8WP/7fFj/+3xY//t8WPz7fFli/H1ZLfx9WSn8fVkp/H1ZKfx9WSj8fVmY+3xY8ft8WP/7fFj0/HxYWPx9WSb8fVkp/H1ZKfx9WSn8fVkp/H1ZKfx9WSn8fVkp/H1ZKft9WCn7fFgp+3xYLPt8WDP7fFg/+3xYY/t8WK77fFjv+3xY//t8WP/7fFj/+3xY//t8WP/7fFjA+3xYQfx9WSf8fVkp/H1ZKfx9WSn8fVkp/H1ZKfx9WSn8fVkp/H1YKft8WCv7fFgv+3xYN/t8WFL7fFiV+3xY6vt8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFjx+3xYK/x8WPD8fFj//HxY//x8WP/8fFj++3xZy/x9Wbn8fVm4/H1ZuPx9Wbj8fVm4/H1Z3fx8WPr8fFj//HxY+/x8WMj8fVm3/H1ZuPx9Wbj8fVm4/H1ZuPx9Wbj8fVm4/H1ZuPx9Wbj8fVi4+3xYuft8WMD7fFjS+3xY7fx8WP78fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY6vx8WMD8fVm3/H1ZuPx9Wbj8fVm4/H1ZuPx9Wbj8fVm4/H1YuPx9WLn7fFi++3xYx/t8WNz7fFj7/HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY8ft8WCX8fFnu/HxY//x8WP/8fFj//HxY//x8Wf/8fFj//HxY//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj/+3xY//t8WP/8fFn//HxZ//x8Wf/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxZ//x8Wf/8fFj//HxY//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj//H1Z//x8WP/8fFj/+3xY//x8WP/8fFn//HxY//x8Wf/8fFj//HxY//x8WfD7fFgX+3xY5ft9WP77fVj/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVj/+31Z//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Z//t9WP/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9WP/7fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Z//t9WP/7fVn/+31Y//t9Wf/7fVj/+31Z//t9Wf/7fVn/+31Y//t9WP/7fVjr+3xYDPt8WM38fVn8/H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn9+3xY2vt8WAn7fFie+3xY+Pt8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t9WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t9WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY//t8WP/7fFj/+3xY+vt8WK37fFgF+3xYXvt9WPL7fVj/+3xY//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fFj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+3xY//t9WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t8WP/7fVj/+31Y//t9WP/7fVj/+31Y//t8WP/7fFj/+31Y//t9WPT7fFhs+3xYAft8WB77fFjd/H1Y/vx9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fFj//H1Y//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fFj//H1Y//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP/8fVj//H1Y//x9WP77fFjj+3xYKQAAAAD7fFgH+3xYkPt9Wfb7fVj//H1Y//t9WP/7fVj/+31Z//t9WP/7fVj/+31Y//x9Wf/7fVj/+31Z//t9WP/7fVj/+31Z//t9WP/8fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj//H1Y//t9WP/7fVn/+31Z//t9Wf/7fVn/+31Y//t9Wf/7fVn/+31Z//t9Wf/7fVj//H1Y//t9WP/7fVj/+31Z//t9WP/7fVj/+31Y//x9Wf/7fVj/+31Z//t9WP/7fVj/+31Z//t9WP/8fVn/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj//H1Y//t9WP/7fVn4+3xYnvt8WAcAAAAA+3xYAvt8WCv7fFjc+31Z/ft9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn++3xY4vt8WDb7fFgCAAAAAPt8WAD7fFgF+3xYefx9We78fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z//x9Wf/8fVn//H1Z8ft8WIb7fFgG+3xYAAAAAAAAAAAA+3xYAPt8WBD7fFiu+31Z9vt9Wf/7fVn/+31Z//t9Wf/7fVn/+3xZ//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+3xZ//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t8Wf/7fVn/+3xZ//t8Wf/7fVn/+31Z//t9Wf/7fFn/+3xZ//t9Wf/7fFn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+3xZ//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z//t9Wf/7fVn/+3xZ//t9Wf/7fVn/+31Z//t9Wf/7fVn/+31Z+Pt8WLf7fFgV+3xYAQAAAAAAAAAAAAAAAPt8WAD7fFgB+3xYI/t8WMD8fFj4/HxY//x8Wf/8fFj//HxZ//x8WP/8fFj//HxY//x8WP/8fFn//HxZ//x8WP/8fFj//HxY//x8WP/8fFn//HxY//x8Wf/8fFj//HxY//x8WP/8fFj//HxY//x8Wf/8fFj//HxY//x8WP/8fFj//HxY//x8Wf/8fFn//HxY//x8WP/8fFj//HxY//x8Wf/8fFj//HxZ//x8WP/8fFj//HxY//x8WP/8fFn//HxZ//x8WP/8fFj//HxY//x8WP/8fFn//HxY//x8Wf/8fFj//HxY+vt8WMj7fFgr+3xYAvt8WAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAL7fFgr+3xYvvx8WPX8fFn+/HxY//x8WP/8fFj//HxY//x8WP/8fFn//HxZ//x8Wf/8fFn//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY//x8WP/8fFn//HxY//x8WP/8fFj//HxY//x8WP/8fFn//HxZ//x8Wf/8fFn//HxY//x8WP/8fFj//HxY//x8WP/8fFj//HxY9/t8WMT7fFgx+3xYAvt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD7fFgA+3xYAvt8WCD7fFil+3xZ6/t8Wf37fFn/+3xZ//t8Wf/7fFn/+31Z//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+31Z//t8Wf/7fFn/+3xZ//t8Wf/7fFn/+3xZ//t8Wf/7fFn9+3xZ7ft8WK77fFgm+3xYAvt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPt8WAD7fFgB+3xYC/t8WGf7fFjT+31Y8/t9WPz7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+3xY//t9WP/7fFj/+31Y//t8WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t8WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+31Y//t9WP/7fVj/+3xY//t9WP37fFj0+3xY1vt8WHD7fFgO+3xYAft8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+nxYAPp8WAD7fFgE+3xYHft8WHb7fFjM/H1Z7fx9WfX8fVn5/H1Z/Px9Wf38fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/vx9Wf78fVn+/H1Z/fx9Wfz8fVn5/H1Z9vx9We77fFjR+3xYfPt8WCH7fFgF+3xYAPt8WAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+3xYAPt8WAH7fFgF+3xYD/t8WED7fFh7+3xYqPt8WMf7fFjZ/H1Z3/x9WeD8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/x9Wd/8fVnf/H1Z3/t8WNv7fFjK+3xYrPt8WH77fFhF+3xYEvt8WAb7fFgB+3xYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+ntXAPp7VwD7fFgD+3xYB/t8WAr7fFgM+3xYDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ38fVkN/H1ZDfx9WQ37fFgN+3xYDPt8WAr7fFgH+3xYBPt8WAH7fFgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wAAAAAAAH/8AAAAAAAAH/gAAAAAAAAP8AAAAAAAAAfgAAAAAAAAA8AAAAAAAAABwAAAAAAAAAGAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPB//+B/+AAA8H//4H/+AADwf//gf/8AAPB4AAAAH4AA8HgAAAAPgADweAAAAAeAAPB4AAAAB4AA8HgAAAAHgADweAAAAAeAAPB4AAAAB4AA8HwAAAAPAADwPgAAAD4AAPA//wAf/AAA8B//gB/8AADwB//AH/wAAPAAB+AAPgAA8AAD4AAPAADwAAHgAAeAAPAAAfAAB4AA8AAB8AAHgADwAAHwAAeAAPAAAeAAB4AA8AAD4AAPgADwAA/gAB8AAPB//8B//wAA8H//gH/+AADwf/4Af/gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAMAAAAAAAAABwAAAAAAAAAHgAAAAAAAAA/AAAAAAAAAH+AAAAAAAAA/8AAAAAAAAH/8AAAAAAAB//+AAAAAAA/8=
+// @match        *://*.123pan.com/*
+// @match        *://*.123pan.cn/*
+// @match        *://*.123684.com/*
+// @match        *://*.123865.com/*
+// @match        *://*.123952.com/*
+// @match        *://*.123912.com/*
+// @connect      *.123pan.com
+// @connect      *.123pan.cn
+// @connect      *.123684.com
+// @connect      *.123865.com
+// @connect      *.123952.com
+// @connect      *.123912.com
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
+// @grant        GM_info
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_xmlhttpRequest
+// @run-at       document-start
+// @downloadURL https://github.com/sjdidk/123pan/raw/main/123pan.js
+// @updateURL https://github.com/sjdidk/123pan/raw/main/123pan.meta.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // 检测unsafeWindow
+    if (typeof (unsafeWindow) === 'undefined') window.unsafeWindow = window;
+
+    /* ============ v1.3.5：捕获页面自身的分享列表请求 ============
+     * 痛点：分享页 SPA 进子目录不改 URL，脚本拿不到"当前目录 id"，只能从根目录
+     * 盲递归。而脚本自己猜的端点（/gsb/s/share-list 不带 ParentFileId、
+     * /api/share/get 可能已下线）都不一定对，于是永远定位不到子目录里的文件。
+     *
+     * 解法：页面自己一定发过正确的列表请求。这里在 document-start 挂钩
+     * XMLHttpRequest / fetch，把分享列表相关的请求与响应原样录下来：
+     *   - 端点（页面实际用的那个）
+     *   - 查询串 / 请求体（含真实的 ParentFileId）
+     *   - 响应里的 InfoList（可直接使用）
+     * 之后定位文件就直接用"页面当前这一层"的数据，不再盲递归。
+     */
+    var __hook = {
+        endpoint: null,      // 页面实际使用的列表端点
+        parentFileId: null,  // 页面最近一次列出的目录 id
+        list: [],            // 最近一次响应里的文件清单
+        seen: 0,
+        log: []
+    };
+
+    function __isListUrl(u) {
+        if (!u) return false;
+        return /share-list|share\/get|share_list|shareList|share\/detail/i.test(String(u));
+    }
+
+    function __readPid(u, body) {
+        try {
+            var m = String(u || '').match(/[?&](?:ParentFileId|parentFileId|parentId)=([^&]+)/);
+            if (m) return decodeURIComponent(m[1]);
+        } catch (e) { }
+        try {
+            if (body && typeof body === 'string') {
+                var j = JSON.parse(body);
+                if (j && (j.ParentFileId != null || j.parentFileId != null)) {
+                    return String(j.ParentFileId != null ? j.ParentFileId : j.parentFileId);
+                }
+                var m2 = body.match(/"?ParentFileId"?\s*[:=]\s*"?(\d+)"?/);
+                if (m2) return m2[1];
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    function __extractList(j) {
+        if (!j) return null;
+        var d = j.data || j.Data || j;
+        var arr = d.InfoList || d.infoList || d.FileList || d.fileList || d.List || d.list;
+        return Array.isArray(arr) ? arr : null;
+    }
+
+    function __record(u, body, respText) {
+        if (!__isListUrl(u)) return;
+        __hook.seen++;
+        __hook.endpoint = String(u).split('?')[0];
+        var pid = __readPid(u, body);
+        if (pid != null) __hook.parentFileId = pid;
+        var arr = null;
+        try { arr = __extractList(JSON.parse(respText || 'null')); } catch (e) { }
+        if (arr && arr.length) __hook.list = arr;
+        if (__hook.log.length < 12) {
+            __hook.log.push({ url: String(u).slice(0, 160), pid: pid, n: arr ? arr.length : -1 });
+        }
+        try {
+            if (typeof pan123State !== 'undefined' && pan123State) {
+                pan123State.hook = { endpoint: __hook.endpoint, parentFileId: __hook.parentFileId, seen: __hook.seen, n: __hook.list.length };
+            }
+        } catch (e) { }
+    }
+
+    try {
+        var __OrigXHR = window.XMLHttpRequest;
+        var __origOpen = __OrigXHR.prototype.open;
+        var __origSend = __OrigXHR.prototype.send;
+        __OrigXHR.prototype.open = function (m, u) {
+            try { this.__u = u; } catch (e) { }
+            return __origOpen.apply(this, arguments);
+        };
+        __OrigXHR.prototype.send = function (b) {
+            var self = this;
+            var u = self.__u;
+            if (__isListUrl(u)) {
+                var __origReady = self.onreadystatechange;
+                self.addEventListener('load', function () {
+                    try { __record(u, b, self.responseText); } catch (e) { }
+                });
+                try { Object.defineProperty(self, 'onreadystatechange', {
+                    set: function (fn) {
+                        self.addEventListener('readystatechange', function () {
+                            if (self.readyState === 4) {
+                                try { __record(u, b, self.responseText); } catch (e) { }
+                            }
+                            if (fn) fn.apply(self, arguments);
+                        });
+                    },
+                    get: function () { return __origReady; },
+                    configurable: true
+                }); } catch (e) { }
+            }
+            return __origSend.apply(this, arguments);
+        };
+    } catch (e) { }
+
+    try {
+        if (window.fetch) {
+            var __origFetch = window.fetch;
+            window.fetch = function () {
+                var args = arguments;
+                var u = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url);
+                var body = args[1] && args[1].body;
+                var p = __origFetch.apply(this, args);
+                try {
+                    if (__isListUrl(u) && p && typeof p.then === 'function') {
+                        p.then(function (r) {
+                            try {
+                                r.clone().text().then(function (t) { __record(u, body, t); });
+                            } catch (e) { __record(u, body, ''); }
+                            return r;
+                        }).catch(function () { });
+                    }
+                } catch (e) { }
+                return p;
+            };
+        }
+    } catch (e) { }
+
+    // === 移动端兼容垫片（1.2.7）===
+    // 根因：本脚本对 GM_getValue / GM_setValue / GM_registerMenuCommand /
+    // GM_setClipboard / GM_xmlhttpRequest 都是**裸调用、无存在性守卫**。
+    // 桌面端油猴/Violentmonkey 全量实现所以看不出问题；手机上 Via / X / M /
+    // 雨见浏览器只实现其中一部分，缺失的那个一调用就抛异常，而
+    // GM_getValue 在 loadConfig()、GM_registerMenuCommand 在 IIFE 顶层 ——
+    // 两者任一缺失都会让整个脚本直接死掉（连界面都出不来）。
+    //
+    // 只补「缺失」的那种，已有实现一律不覆盖；因此调用点零改动。
+    //
+    // ⚠ 2026-10-08 修正（4 浏览器真实分享页自检发现）：
+    //   垫片写在 IIFE 内，`var GM_getValue, ...` 会**遮蔽**引擎提供的同名全局函数，
+    //   于是 `typeof GM_getValue !== 'function'` 恒为真 → 无条件覆盖引擎实现。
+    //   在 Tampermonkey（雨见内置 5.4.1）上实测：4 个 API 全部 OVERRIDDEN ——
+    //   GM_registerMenuCommand 被换成空函数（脚本菜单失效）、GM_setValue 被降到 localStorage。
+    //   修法：先用**不受 var 遮蔽**的三条通道（间接 eval → unsafeWindow → window）取引擎真值，
+    //   取到就用它；三条都取不到（引擎确实没实现）才装兜底。调用点仍零改动。
+    var __gmGrab = function (name) {
+        try {
+            var v = (0, eval)("typeof " + name + " === 'function' ? " + name + " : null");
+            if (v) { return v; }
+        } catch (e) { }
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow &&
+                typeof unsafeWindow[name] === 'function') { return unsafeWindow[name]; }
+        } catch (e) { }
+        try {
+            if (typeof window !== 'undefined' && window &&
+                typeof window[name] === 'function') { return window[name]; }
+        } catch (e) { }
+        return null;
+    };
+    var __gmEnv = {
+        get: __gmGrab('GM_getValue'),
+        set: __gmGrab('GM_setValue'),
+        menu: __gmGrab('GM_registerMenuCommand'),
+        clip: __gmGrab('GM_setClipboard')
+    };
+    var GM_getValue = __gmEnv.get || function (key, defaultValue) {
+        try {
+            var raw = localStorage.getItem('pan123fix:' + key);
+            return raw === null ? defaultValue : JSON.parse(raw);
+        } catch (e) { return defaultValue; }
+    };
+    var GM_setValue = __gmEnv.set || function (key, value) {
+        try { localStorage.setItem('pan123fix:' + key, JSON.stringify(value)); } catch (e) { }
+    };
+    // 没有脚本菜单不是错误：手机端的入口由设置面板里的「提取当前分享直链」按钮兜底。
+    var GM_registerMenuCommand = __gmEnv.menu || function () { };
+    var GM_setClipboard = __gmEnv.clip || function (text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try { navigator.clipboard.writeText(text); return; } catch (e) { }
+        }
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { ta.setSelectionRange(0, ta.value.length); } catch (e) { }
+        try { document.execCommand('copy'); } catch (e) { }
+        document.body.removeChild(ta);
+    };
+    // 触屏判定：用于把「hover 才展开的下拉菜单」改成点按展开。
+    var IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    // === 垫片结束 ===
+
+    // 配置验证和加载函数
+    function loadConfig() {
+        const defaultConfig = {
+            vip: 1,
+            svip: 1,
+            pvip: 0,
+            ad: 1,
+            name: "QingJ",
+            photo: "http://q.qlogo.cn/headimg_dl?dst_uin=2903609300&spec=640&img_type=jpg",
+            mail: "",
+            phone: "",
+            id: "",
+            level: 128,
+            endtime: 253402185600,
+            debug: 0,
+            // === 2026 修复项 ===
+            bypassCheck: 1,   // 接管 /share/download/traffic/check，放行客户端侧校验（服务端若拒绝仍会给出原因）
+            directLink: 1     // 允许「提取直链」按当前接口取回下载地址
+        };
+
+        const config = {};
+        
+        for (const [key, defaultValue] of Object.entries(defaultConfig)) {
+            let value = GM_getValue(key, defaultValue);
+            
+            // 类型验证
+            if (typeof value !== typeof defaultValue) {
+                console.warn(`[123云盘解锁] 配置项 ${key} 类型错误，使用默认值`);
+                value = defaultValue;
+            }
+            
+            // 数值范围验证
+            if (key === 'level' && (typeof value !== 'number' || value < 0 || value > 128)) {
+                console.warn(`[123云盘解锁] 等级值超出范围，使用默认值`);
+                value = 128;
+            }
+            
+            // VIP逻辑验证
+            if (key === 'vip' && (value !== 0 && value !== 1)) {
+                value = 1;
+            }
+            if (key === 'svip' && (value !== 0 && value !== 1)) {
+                value = 1;
+            }
+            if (key === 'pvip' && (value !== 0 && value !== 1)) {
+                value = 0;
+            }
+            
+            // URL验证（宽松检查）
+            if (key === 'photo' && value && typeof value === 'string') {
+                if (value.length > 2000) {
+                    console.warn(`[123云盘解锁] 头像URL过长，使用默认值`);
+                    value = defaultValue;
+                }
+            }
+            
+            config[key] = value;
+        }
+        
+        return config;
+    }
+
+    // 从存储中读取配置（带验证）
+    var user = loadConfig();
+
+    // =============================================================================
+    // 秒传功能模块 - 整合自 123FastLink
+    // 特别鸣谢：@Baoqing、@Chaofan、@lipkiat
+    // =============================================================================
+
+    // 秒传配置
+    const FastLinkConfig = {
+        enabled: GM_getValue('fastlink_enabled', 1),
+        getFileListPageDelay: 500,
+        getFileInfoBatchSize: 100,
+        getFileInfoDelay: 200,
+        getFolderInfoDelay: 300,
+        saveLinkDelay: 100,
+        mkdirDelay: 100,
+        usesBase62EtagsInExport: true,
+        COMMON_PATH_LINK_PREFIX: "123FLCPV2$"
+    };
+
+    // 1. API通信类
+    class PanApiClient {
+        constructor() {
+            this.host = 'https://' + window.location.host;
+            this.authToken = null;
+            this.loginUuid = null;
+            this.progress = 0;
+            this.progressDesc = "";
+        }
+
+        init() {
+            this.authToken = localStorage['authorToken'];
+            this.loginUuid = localStorage['LoginUuid'];
+        }
+
+        buildURL(path, queryParams) {
+            const queryString = new URLSearchParams(queryParams || {}).toString();
+            return `${this.host}${path}?${queryString}`;
+        }
+
+        async sendRequest(method, path, queryParams, body) {
+            const headers = {
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Authorization': 'Bearer ' + this.authToken,
+                'platform': 'web',
+                'App-Version': '3',
+                'LoginUuid': this.loginUuid,
+                'Origin': this.host,
+                'Referer': document.location.href,
+            };
+            try {
+                const response = await fetch(this.buildURL(path, queryParams), {
+                    method, headers, body, credentials: 'include'
+                });
+                const data = await response.json();
+                if (data.code !== 0) {
+                    throw new Error(data.message);
+                }
+                return data;
+            } catch (e) {
+                console.error('[123云盘解锁] API请求失败:', e);
+                throw e;
+            }
+        }
+
+        async getOnePageFileList(parentFileId, page) {
+            const urlParams = {
+                driveId: '0',
+                limit: '100',
+                next: '0',
+                orderBy: 'file_name',
+                orderDirection: 'asc',
+                parentFileId: parentFileId.toString(),
+                trashed: 'false',
+                SearchData: '',
+                Page: page.toString(),
+                OnlyLookAbnormalFile: '0',
+                event: 'homeListFile',
+                operateType: '1',
+                inDirectSpace: 'false'
+            };
+            const data = await this.sendRequest("GET", "/b/api/file/list/new", urlParams);
+            return { data: { InfoList: data.data.InfoList }, total: data.data.Total };
+        }
+
+        async getFileList(parentFileId) {
+            let InfoList = [];
+            this.progress = 0;
+            this.progressDesc = `获取文件列表 ID：${parentFileId}`;
+            const info = await this.getOnePageFileList(parentFileId, 1);
+            InfoList.push(...info.data.InfoList);
+            const total = info.total;
+            if (total > 100) {
+                const times = Math.ceil(total / 100);
+                for (let i = 2; i < times + 1; i++) {
+                    this.progress = Math.ceil((i / times) * 100);
+                    const pageInfo = await this.getOnePageFileList(parentFileId, i);
+                    InfoList.push(...pageInfo.data.InfoList);
+                    await new Promise(resolve => setTimeout(resolve, FastLinkConfig.getFileListPageDelay));
+                }
+            }
+            this.progress = 100;
+            return { data: { InfoList }, total: total };
+        }
+
+        async getFileInfo(idList) {
+            const fileIdList = idList.map(fileId => ({ fileId }));
+            const data = await this.sendRequest("POST", "/b/api/file/info", {}, JSON.stringify({ fileIdList }));
+            return { data: { InfoList: data.data.infoList } };
+        }
+
+        async uploadRequest(fileInfo) {
+            try {
+                const response = await this.sendRequest('POST', '/b/api/file/upload_request', {}, JSON.stringify({
+                    ...fileInfo, RequestSource: null
+                }));
+                const reuse = response['data']['Reuse'];
+                if (response['code'] !== 0) {
+                    return [false, response['message']];
+                }
+                if (!reuse) {
+                    return [false, "未能实现秒传"];
+                } else {
+                    return [true, null];
+                }
+            } catch (error) {
+                console.error('[123云盘解锁] 上传请求失败:', error);
+                return [false, '请求失败'];
+            }
+        }
+
+        async getParentFileId() {
+            const homeFilePath = JSON.parse(sessionStorage['filePath'])['homeFilePath'];
+            const parentFileId = (homeFilePath[homeFilePath.length - 1] || 0);
+            return parentFileId.toString();
+        }
+
+        async getFile(fileInfo, parentFileId) {
+            if (!parentFileId) {
+                parentFileId = await this.getParentFileId();
+            }
+            return await this.uploadRequest({
+                driveId: 0,
+                etag: fileInfo.etag,
+                fileName: fileInfo.fileName,
+                parentFileId,
+                size: fileInfo.size,
+                type: 0,
+                duplicate: 1
+            });
+        }
+
+        async mkdir(parentFileId, folderName = "New Folder") {
+            let folderFileId = null;
+            try {
+                const response = await this.sendRequest('POST', '/b/api/file/upload_request', {}, JSON.stringify({
+                    driveId: 0,
+                    etag: "",
+                    fileName: folderName,
+                    parentFileId,
+                    size: 0,
+                    type: 1,
+                    duplicate: 1,
+                    NotReuse: true,
+                    event: "newCreateFolder",
+                    operateType: 1,
+                    RequestSource: null
+                }));
+                folderFileId = response['data']['Info']['FileId'];
+            } catch (error) {
+                console.error('[123云盘解锁] 创建文件夹失败:', error);
+                return { 'folderFileId': null, 'folderName': folderName, 'success': false };
+            }
+            return { 'folderFileId': folderFileId, 'folderName': folderName, 'success': true };
+        }
+    }
+
+    // 2. 选中文件管理类
+    class TableRowSelector {
+        constructor() {
+            this.selectedRowKeys = [];
+            this.unselectedRowKeys = [];
+            this.isSelectAll = false;
+            this._inited = false;
+        }
+
+        init() {
+            if (this._inited) return;
+            this._inited = true;
+            const originalCreateElement = document.createElement;
+            const self = this;
+            document.createElement = function (tagName, options) {
+                const element = originalCreateElement.call(document, tagName, options);
+                const observer = new MutationObserver(() => {
+                    if (element.classList.contains('ant-table-row') && element.classList.contains('ant-table-row-level-0')) {
+                        const input = element.querySelector('input');
+                        if (input) {
+                            input.addEventListener('click', function () {
+                                const rowKey = element.getAttribute('data-row-key');
+                                if (self.isSelectAll) {
+                                    if (!this.checked) {
+                                        if (!self.unselectedRowKeys.includes(rowKey)) {
+                                            self.unselectedRowKeys.push(rowKey);
+                                        }
+                                    } else {
+                                        const idx = self.unselectedRowKeys.indexOf(rowKey);
+                                        if (idx > -1) {
+                                            self.unselectedRowKeys.splice(idx, 1);
+                                        }
+                                    }
+                                } else {
+                                    if (this.checked) {
+                                        if (!self.selectedRowKeys.includes(rowKey)) {
+                                            self.selectedRowKeys.push(rowKey);
+                                        }
+                                    } else {
+                                        const idx = self.selectedRowKeys.indexOf(rowKey);
+                                        if (idx > -1) {
+                                            self.selectedRowKeys.splice(idx, 1);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        observer.disconnect();
+                    } else if (element.classList.contains('ant-checkbox-input') && element.getAttribute('aria-label') === 'Select all') {
+                        if (!(element.parentElement.classList.contains('ant-checkbox-indeterminate') || element.parentElement.classList.contains('ant-checkbox-checked'))) {
+                            self.unselectedRowKeys = [];
+                            self.selectedRowKeys = [];
+                            self.isSelectAll = false;
+                        }
+                        self._bindSelectAllEvent(element);
+                    } else if (element.classList.contains('ant-btn') && element.classList.contains('ant-btn-link')) {
+                        element.addEventListener('click', function () {
+                            self.selectedRowKeys = [];
+                            self.unselectedRowKeys = [];
+                            self.isSelectAll = false;
+                        });
+                    }
+                });
+                observer.observe(element, {
+                    attributes: true, attributeFilter: ['class', 'aria-label']
+                });
+                return element;
+            };
+        }
+
+        _bindSelectAllEvent(checkbox) {
+            if (checkbox.dataset.selectAllBound) return;
+            checkbox.dataset.selectAllBound = 'true';
+            checkbox.addEventListener('click', () => {
+                if (checkbox.checked) {
+                    this.isSelectAll = true;
+                    this.unselectedRowKeys = [];
+                    this.selectedRowKeys = [];
+                } else {
+                    this.isSelectAll = false;
+                    this.selectedRowKeys = [];
+                    this.unselectedRowKeys = [];
+                }
+            });
+        }
+
+        getSelection() {
+            return {
+                isSelectAll: this.isSelectAll,
+                selectedRowKeys: [...this.selectedRowKeys],
+                unselectedRowKeys: [...this.unselectedRowKeys]
+            };
+        }
+    }
+
+    // 3. 秒传链接管理类
+    class ShareLinkManager {
+        constructor(apiClient) {
+            this.apiClient = apiClient;
+            this.progress = 0;
+            this.progressDesc = "";
+            this.taskCancel = false;
+            this.fileInfoList = [];
+            this.commonPath = "";
+        }
+
+        async _getAllFileInfoByFolderId(parentFileId, folderName = '', total) {
+            this.progressDesc = `正在扫描文件夹：${folderName}`;
+            let progress = this.progress;
+            const progressUpdater = setInterval(() => {
+                this.progress = progress + this.apiClient.progress / total;
+                this.progressDesc = this.apiClient.progressDesc;
+                if (this.progress > 100) {
+                    clearInterval(progressUpdater);
+                }
+            }, 500);
+            const allFileInfoList = (await this.apiClient.getFileList(parentFileId)).data.InfoList.map(file => ({
+                fileName: file.FileName, etag: file.Etag, size: file.Size, type: file.Type, fileId: file.FileId
+            }));
+            clearInterval(progressUpdater);
+
+            const fileInfo = allFileInfoList.filter(file => file.type !== 1);
+            fileInfo.forEach(file => {
+                file.path = folderName + file.fileName;
+            });
+            this.fileInfoList.push(...fileInfo);
+
+            const directoryFileInfo = allFileInfoList.filter(file => file.type === 1);
+            for (const folder of directoryFileInfo) {
+                await new Promise(resolve => setTimeout(resolve, FastLinkConfig.getFolderInfoDelay));
+                if (this.taskCancel) {
+                    this.progressDesc = "任务已取消";
+                    return;
+                }
+                await this._getAllFileInfoByFolderId(folder.fileId, folderName + folder.fileName + "/", total * directoryFileInfo.length);
+            }
+            this.progress = progress + 100 / total;
+        }
+
+        async _getFileInfoBatch(idList) {
+            const total = idList.length;
+            let completed = 0;
+            let allFileInfo = [];
+            for (let i = 0; i < total; i += FastLinkConfig.getFileInfoBatchSize) {
+                const batch = idList.slice(i, i + FastLinkConfig.getFileInfoBatchSize);
+                try {
+                    const response = await this.apiClient.getFileInfo(batch);
+                    allFileInfo = allFileInfo.concat(response.data.InfoList || []);
+                } catch (e) {
+                    console.error('[123云盘解锁] 获取文件信息失败:', e);
+                }
+                completed += batch.length;
+                this.progress = Math.round((completed / total) * 100 - 1);
+                this.progressDesc = `正在获取文件信息... (${completed} / ${total})`;
+                await new Promise(resolve => setTimeout(resolve, FastLinkConfig.getFileInfoDelay));
+            }
+            return allFileInfo.map(file => ({
+                fileName: file.FileName, etag: file.Etag, size: file.Size, type: file.Type, fileId: file.FileId
+            }));
+        }
+
+        async _getCommonPath() {
+            if (!this.fileInfoList || this.fileInfoList.length === 0) return '';
+            const pathArrays = this.fileInfoList.map(file => {
+                const path = file.path || '';
+                const lastSlashIndex = path.lastIndexOf('/');
+                return lastSlashIndex === -1 ? [] : path.substring(0, lastSlashIndex).split('/');
+            });
+            let commonPrefix = [];
+            const firstPath = pathArrays[0];
+            for (let i = 0; i < firstPath.length; i++) {
+                const currentComponent = firstPath[i];
+                const allMatch = pathArrays.every(pathArray => pathArray.length > i && pathArray[i] === currentComponent);
+                if (allMatch) {
+                    commonPrefix.push(currentComponent);
+                } else {
+                    break;
+                }
+            }
+            const commonPath = commonPrefix.length > 0 ? commonPrefix.join('/') + '/' : '';
+            this.commonPath = commonPath;
+            return commonPath;
+        }
+
+        async _getSelectedFilesInfo(fileSelectionDetails) {
+            this.fileInfoList = [];
+            if (!fileSelectionDetails.isSelectAll && fileSelectionDetails.selectedRowKeys.length === 0) {
+                return false;
+            }
+            let fileSelectFolderInfoList = [];
+            if (fileSelectionDetails.isSelectAll) {
+                this.progress = 10;
+                this.progressDesc = "正在递归获取选择的文件..."
+                let allFileInfo = (await this.apiClient.getFileList(await this.apiClient.getParentFileId())).data.InfoList.map(file => ({
+                    fileName: file.FileName, etag: file.Etag, size: file.Size, type: file.Type, fileId: file.FileId
+                }));
+                let fileInfo = allFileInfo.filter(file => file.type !== 1);
+                fileInfo.filter(file => !fileSelectionDetails.unselectedRowKeys.includes(file.fileId.toString())).forEach(file => {
+                    file.path = file.fileName;
+                });
+                this.fileInfoList.push(...fileInfo);
+                fileSelectFolderInfoList = allFileInfo.filter(file => file.type === 1).filter(file => !fileSelectionDetails.unselectedRowKeys.includes(file.fileId.toString()));
+            } else {
+                let fileSelectIdList = fileSelectionDetails.selectedRowKeys;
+                if (!fileSelectIdList.length) {
+                    this.progress = 100;
+                    this.progressDesc = "未选择文件";
+                    return false;
+                }
+                const allFileInfo = await this._getFileInfoBatch(fileSelectIdList);
+                const fileInfo = allFileInfo.filter(info => info.type !== 1);
+                fileInfo.forEach(file => {
+                    file.path = file.fileName;
+                });
+                this.fileInfoList.push(...fileInfo);
+                fileSelectFolderInfoList = allFileInfo.filter(info => info.type === 1);
+            }
+
+            for (let i = 0; i < fileSelectFolderInfoList.length; i++) {
+                const folderInfo = fileSelectFolderInfoList[i];
+                this.progress = Math.round((i / fileSelectFolderInfoList.length) * 100);
+                await new Promise(resolve => setTimeout(resolve, FastLinkConfig.getFolderInfoDelay));
+                if (this.taskCancel) {
+                    this.progressDesc = "任务已取消";
+                    return true;
+                }
+                await this._getAllFileInfoByFolderId(folderInfo.fileId, folderInfo.fileName + "/", fileSelectFolderInfoList.length);
+            }
+            const commonPath = await this._getCommonPath();
+            if (commonPath) {
+                this.fileInfoList.forEach(info => {
+                    info.path = info.path.slice(commonPath.length);
+                });
+            }
+            return true;
+        }
+
+        async generateShareLink(fileSelectionDetails) {
+            this.progress = 0;
+            this.progressDesc = "准备获取文件信息...";
+            const result = await this._getSelectedFilesInfo(fileSelectionDetails);
+            if (!result) return '';
+            this.progressDesc = "秒传链接生成完成";
+            return this.buildShareLink(this.fileInfoList, this.commonPath);
+        }
+
+        buildShareLink(fileInfoList, commonPath) {
+            const shareLinkFileInfo = fileInfoList.map(info => {
+                return [FastLinkConfig.usesBase62EtagsInExport ? this._hexToBase62(info.etag) : info.etag, info.size, info.path.replace(/[%#$]/g, '')].join('#');
+            }).filter(Boolean).join('$');
+            const shareLink = `${FastLinkConfig.COMMON_PATH_LINK_PREFIX}${commonPath}%${shareLinkFileInfo}`;
+            return shareLink;
+        }
+
+        _parseShareLink(shareLink, InputUsesBase62 = true) {
+            let commonPath = '';
+            let shareFileInfo = '';
+            if (shareLink.slice(0, 4) === "123F") {
+                const commonPathLinkPrefix = shareLink.split('$')[0];
+                shareLink = shareLink.replace(`${commonPathLinkPrefix}$`, '');
+                if (commonPathLinkPrefix + "$" === FastLinkConfig.COMMON_PATH_LINK_PREFIX) {
+                    commonPath = shareLink.split('%')[0];
+                    shareFileInfo = shareLink.replace(`${commonPath}%`, '');
+                } else {
+                    return null;
+                }
+            } else {
+                shareFileInfo = shareLink;
+                InputUsesBase62 = false;
+            }
+            const shareLinkList = Array.from(shareFileInfo.replace(/\r?\n/g, '$').split('$'));
+            this.commonPath = commonPath;
+            return shareLinkList.map(singleShareLink => {
+                const singleFileInfoList = singleShareLink.split('#');
+                if (singleFileInfoList.length < 3) return null;
+                return {
+                    etag: InputUsesBase62 ? this._base62ToHex(singleFileInfoList[0]) : singleFileInfoList[0],
+                    size: singleFileInfoList[1],
+                    path: singleFileInfoList[2],
+                    fileName: singleFileInfoList[2].split('/').pop()
+                };
+            }).filter(Boolean);
+        }
+
+        async _makeDirForFiles(shareFileList) {
+            const total = shareFileList.length;
+            this.progressDesc = `正在创建文件夹...`;
+            let folder = {};
+            const rootFolderId = await this.apiClient.getParentFileId();
+            if (this.commonPath) {
+                const commonPathParts = this.commonPath.split('/').filter(part => part !== '');
+                let currentParentId = rootFolderId;
+                for (let i = 0; i < commonPathParts.length; i++) {
+                    const currentPath = commonPathParts.slice(0, i + 1).join('/');
+                    const folderName = commonPathParts[i];
+                    if (!folder[currentPath]) {
+                        const newFolder = await this.apiClient.mkdir(currentParentId, folderName);
+                        await new Promise(resolve => setTimeout(resolve, FastLinkConfig.mkdirDelay));
+                        folder[currentPath] = newFolder.folderFileId;
+                    }
+                    currentParentId = folder[currentPath];
+                }
+            } else {
+                folder[''] = rootFolderId;
+            }
+
+            for (let i = 0; i < shareFileList.length; i++) {
+                const item = shareFileList[i];
+                const itemPath = item.path.split('/').slice(0, -1);
+                let nowParentFolderId = folder[this.commonPath.slice(0, -1)] || rootFolderId;
+                for (let i = 0; i < itemPath.length; i++) {
+                    const path = itemPath.slice(0, i + 1).join('/');
+                    if (!folder[path]) {
+                        const newFolderID = await this.apiClient.mkdir(nowParentFolderId, itemPath[i]);
+                        await new Promise(resolve => setTimeout(resolve, FastLinkConfig.mkdirDelay));
+                        folder[path] = newFolderID.folderFileId;
+                        nowParentFolderId = newFolderID.folderFileId;
+                    } else {
+                        nowParentFolderId = folder[path];
+                    }
+                    if (this.taskCancel) {
+                        this.progressDesc = "任务已取消";
+                        return shareFileList;
+                    }
+                }
+                shareFileList[i].parentFolderId = nowParentFolderId;
+                this.progress = Math.round((i / total) * 100);
+                this.progressDesc = `正在创建文件夹... (${i + 1} / ${total})`;
+            }
+            return shareFileList;
+        }
+
+        async _saveFileList(shareFileList) {
+            let completed = 0;
+            let successList = [];
+            let failedList = [];
+            const total = shareFileList.length;
+            for (let i = 0; i < shareFileList.length; i++) {
+                if (this.taskCancel) {
+                    this.progressDesc = "任务已取消";
+                    break;
+                }
+                const fileInfo = shareFileList[i];
+                if (i > 0) {
+                    await new Promise(resolve => setTimeout(resolve, FastLinkConfig.saveLinkDelay));
+                }
+                const reuse = await this.apiClient.getFile({
+                    etag: fileInfo.etag, size: fileInfo.size, fileName: fileInfo.fileName
+                }, fileInfo.parentFolderId);
+                if (reuse[0]) {
+                    successList.push(fileInfo);
+                } else {
+                    fileInfo.error = reuse[1];
+                    failedList.push(fileInfo);
+                }
+                completed++;
+                this.progress = Math.round((completed / total) * 100);
+                this.progressDesc = `正在保存第 ${completed} / ${total} 个文件...`;
+            }
+            return { success: successList, failed: failedList, commonPath: this.commonPath };
+        }
+
+        async saveShareLink(content) {
+            let saveResult = { success: [], failed: [] };
+            try {
+                const jsonData = this.safeParse(content);
+                if (jsonData && this.validateJson(jsonData)) {
+                    saveResult = await this.saveJsonShareLink(jsonData);
+                } else {
+                    const shareFileList = this._parseShareLink(content);
+                    if (!shareFileList) return { success: [], failed: [] };
+                    saveResult = await this._saveFileList(await this._makeDirForFiles(shareFileList));
+                }
+            } catch (error) {
+                console.error('[123云盘解锁] 保存失败:', error);
+                saveResult = { success: [], failed: [] };
+            }
+            return saveResult;
+        }
+
+        _base62chars() {
+            return '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        }
+
+        _hexToBase62(hex) {
+            if (!hex) return '';
+            let num = BigInt('0x' + hex);
+            if (num === 0n) return '0';
+            let chars = [];
+            const base62 = this._base62chars();
+            while (num > 0n) {
+                chars.push(base62[Number(num % 62n)]);
+                num = num / 62n;
+            }
+            return chars.reverse().join('');
+        }
+
+        _base62ToHex(base62) {
+            if (!base62) return '';
+            const chars = this._base62chars();
+            let num = 0n;
+            for (let i = 0; i < base62.length; i++) {
+                num = num * 62n + BigInt(chars.indexOf(base62[i]));
+            }
+            let hex = num.toString(16);
+            if (hex.length % 2) hex = '0' + hex;
+            while (hex.length < 32) hex = '0' + hex;
+            return hex;
+        }
+
+        // JSON相关功能
+        safeParse(str) {
+            try {
+                return JSON.parse(str);
+            } catch {
+                return null;
+            }
+        }
+
+        _formatSize(size) {
+            if (size < 1024) return size + ' B';
+            if (size < 1024 * 1024) return (size / 1024).toFixed(2) + ' KB';
+            if (size < 1024 * 1024 * 1024) return (size / 1024 / 1024).toFixed(2) + ' MB';
+            return (size / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+        }
+
+        validateJson(json) {
+            return (json && Array.isArray(json.files) && json.files.every(f => f.etag && f.size && f.path));
+        }
+
+        shareLinkToJson(shareLink) {
+            const fileInfo = this._parseShareLink(shareLink);
+            if (fileInfo.length === 0) {
+                console.error('[123云盘解锁] 解析秒传链接失败:', shareLink);
+                return { error: '解析秒传链接失败' };
+            }
+            if (FastLinkConfig.usesBase62EtagsInExport) {
+                fileInfo.forEach(f => {
+                    f.etag = this._hexToBase62(f.etag);
+                });
+            }
+            const totalSize = fileInfo.reduce((sum, f) => sum + Number(f.size), 0);
+            return {
+                scriptVersion: "1.2.1",
+                exportVersion: "1.0",
+                usesBase62EtagsInExport: FastLinkConfig.usesBase62EtagsInExport,
+                commonPath: this.commonPath,
+                totalFilesCount: fileInfo.length,
+                totalSize,
+                formattedTotalSize: this._formatSize(totalSize),
+                files: fileInfo.map(f => ({
+                    etag: f.etag,
+                    size: f.size,
+                    path: f.path
+                }))
+            };
+        }
+
+        _parseJsonShareLink(jsonData) {
+            this.commonPath = jsonData['commonPath'] || '';
+            const shareFileList = jsonData['files'];
+            if (jsonData['usesBase62EtagsInExport']) {
+                shareFileList.forEach(file => {
+                    file.etag = this._base62ToHex(file.etag);
+                });
+            }
+            shareFileList.forEach(file => {
+                file.fileName = file.path.split('/').pop();
+            });
+            return shareFileList;
+        }
+
+        async saveJsonShareLink(jsonContent) {
+            const shareFileList = this._parseJsonShareLink(jsonContent);
+            return this._saveFileList(await this._makeDirForFiles(shareFileList));
+        }
+
+        async retrySaveFailed(FileList) {
+            return this._saveFileList(FileList);
+        }
+    }
+
+    // 秒传功能初始化
+    let panApiClient = null;
+    let tableRowSelector = null;
+    let shareLinkManager = null;
+    
+    // 任务队列系统
+    let taskList = [];
+    let isTaskRunning = false;
+    let taskIdCounter = 0;
+    let currentTask = null;
+    let isProgressMinimized = false;
+    const minimizeWidgetId = 'fastlink-progress-minimize-widget';
+
+    function initFastLink() {
+        if (!FastLinkConfig.enabled) return;
+        
+        panApiClient = new PanApiClient();
+        tableRowSelector = new TableRowSelector();
+        shareLinkManager = new ShareLinkManager(panApiClient);
+        
+        // 初始化
+        panApiClient.init();
+        tableRowSelector.init();
+    }
+
+    // =============================================================================
+    // 秒传功能模块结束
+    // =============================================================================
+
+    // 保存原始方法
+    const originalXHR = unsafeWindow.XMLHttpRequest;
+    const originalFetch = unsafeWindow.fetch;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    // 创建唯一标识符
+    const requestURLSymbol = Symbol('requestURL');
+    const modifiedHeadersSymbol = Symbol('modifiedHeaders');
+    const handlerSymbol = Symbol('readyStateHandler');
+
+    // 规则配置
+    const rules = [
+        {
+            // 用户信息
+            runat: "end",
+            match: (url) => url.pathname.includes('api/user/info'),
+            condition: () => user.vip === 1,
+            action: (res) => {
+                if (!res.data) return res;
+
+                res.data.Vip = true;
+                res.data.VipLevel = user.pvip ? 3 : (user.svip ? 2 : 1);
+
+                if (user.ad === 1) res.data.IsShowAdvertisement = false;
+
+                // 确保UserVipDetail存在
+                if (!res.data.UserVipDetail) {
+                    res.data.UserVipDetail = {};
+                }
+                res.data.UserVipDetail.VipCode = res.data.VipLevel;
+
+                if (user.pvip === 1) {
+                    // 长期会员
+                    res.data.VipExpire = "永久有效";
+                    res.data.UserVipDetail.UserPermanentVIPDetailInfos = [{
+                        VipDesc: "长期VIP会员",
+                        TimeDesc: " 永久有效",
+                        IsUse: true
+                    }];
+                    res.data.UserVipDetailInfos = [];
+                } else if (user.svip === 1) {
+                    // 超级会员
+                    let time = new Date(user.endtime * 1000);
+                    res.data.VipExpire = time.toLocaleString();
+                    res.data.UserVipDetailInfos = [{
+                        VipDesc: "SVIP 会员",
+                        TimeDesc: time.toLocaleDateString() + " 到期",
+                        IsUse: time >= new Date()
+                    }];
+                } else {
+                    // 普通会员
+                    let time = new Date(user.endtime * 1000);
+                    res.data.VipExpire = time.toLocaleString();
+                    res.data.UserVipDetailInfos = [{
+                        VipDesc: "VIP 会员",
+                        TimeDesc: time.toLocaleDateString() + " 到期",
+                        IsUse: time >= new Date()
+                    }];
+                }
+
+                if (user.name) res.data.Nickname = user.name;
+                if (user.photo) res.data.HeadImage = user.photo;
+                if (user.mail) res.data.Mail = user.mail;
+                if (user.phone) res.data.Passport = Number(user.phone);
+                if (user.id) res.data.UID = Number(user.id);
+                if (user.level) res.data.GrowSpaceAddCount = Number(user.level);
+
+                return res;
+            }
+        },
+        {
+            // 用户报告信息
+            runat: "end",
+            match: (url) => url.pathname.includes('user/report/info'),
+            condition: () => user.vip === 1,
+            action: (res) => {
+                if (res && res.data) {
+                    res.data.vipType = user.pvip ? 3 : (user.svip ? 2 : 1);
+                    res.data.vipSub = user.pvip ? 3 : (user.svip ? 2 : 1);
+                    res.data.developSub = user.pvip ? 3 : (user.svip ? 2 : 1);
+                }
+                return res;
+            }
+        },
+        {
+            // 新版分享访客报告接口（老版为 user/report/info）：会员态在这里回吐给前端
+            runat: "end",
+            match: (url) => url.pathname.includes('restful/goapi/v1/share/report/info')
+                          || url.pathname.includes('restful/goapi/v1/share/visitor/info'),
+            condition: () => user.vip === 1,
+            action: (res) => {
+                if (res && res.data && typeof res.data === 'object') {
+                    const lv = user.pvip ? 3 : (user.svip ? 2 : 1);
+                    if ('vipType' in res.data) res.data.vipType = lv;
+                    if ('vipSub' in res.data) res.data.vipSub = lv;
+                    if ('developSub' in res.data) res.data.developSub = lv;
+                }
+                return res;
+            }
+        },
+        {
+            // 下载请求头：当前生效的接口面（web 端 /v2/* 与 /share/*，旧 /a/api/* 已 404）
+            runat: "header",
+            match: (url) => [
+                '/v2/share/download/info',
+                '/v2/file/batch_download_share_info',
+                'share/download-list',
+                'file/download_info',
+                'file/batch_download_info'
+            ].some(path => url.pathname.includes(path)),
+            condition: () => true,
+            action: (headers) => {
+                // 让服务端走 App 侧应答（历史绕过点；登录态下由服务端决定是否放行）
+                headers.platform = 'android';
+                return headers;
+            }
+        },
+        {
+            // 下载前置校验：2026 新增闸门（isBlocked / isTrafficExceeded / isPay）
+            runat: "end",
+            match: (url) => url.pathname.includes('share/download/traffic/check'),
+            condition: () => user.bypassCheck === 1,
+            action: (res) => {
+                if (!res || typeof res !== 'object' || !res.data) return res;
+                const d = res.data;
+                const wasBlocked = d.isBlocked === true || d.isTrafficExceeded === true;
+                d.origIsBlocked = d.isBlocked;
+                d.origIsTrafficExceeded = d.isTrafficExceeded;
+                d.isBlocked = false;
+                d.isTrafficExceeded = false;
+                d.clientFileSize = d.clientFileSize || 0;
+                if (wasBlocked) {
+                    console.info('[123云盘解锁] 已放行下载前置校验，交由服务端给最终结论', d);
+                }
+                return res;
+            }
+        },
+        {
+            // 下载信息处理：兼容旧版 DownloadUrl 与 2026 版 dispatchList + downloadPath
+            runat: "end",
+            match: (url) => [
+                '/v2/share/download/info',
+                '/v2/file/batch_download_share_info',
+                'share/download-list',
+                'file/download_info',
+                'file/batch_download_info',
+                'file/batch_download_share_info'
+            ].some(path => url.pathname.includes(path)),
+            condition: () => true,
+            action: (res, url) => {
+                if (!res || typeof res !== 'object') return res;
+
+                // 服务端结论：5112 需登录/付费，5113、5114 流量类限制
+                if (res.code === 5112) {
+                    showFastLinkToast('服务端要求登录：免费账号每月 10GB 提取流量，或分享者需开启分享流量包', 'warning', 6000);
+                    return Object.assign({}, res, { code: 5112, message: res.message || '您需要注册登录或付费后下载' });
+                }
+                if (res.code === 5113 || res.code === 5114 || (res.message || '').includes('下载流量已超出')) {
+                    if (url.pathname.includes('batch_download')) {
+                        showFastLinkToast('批量提取被服务端限制（请单文件提取）', 'warning', 4000);
+                    } else {
+                        showFastLinkToast('今日提取流量已超出限制，已拦截支付窗口', 'warning', 4000);
+                    }
+                    return { code: 400, message: '已拦截', data: null };
+                }
+
+                const built = buildDownloadUrlFromResponse(res);
+                if (built && built.url) {
+                    try {
+                        res.data = res.data || {};
+                        if (res.data.DownloadUrl !== undefined) res.data.DownloadUrl = built.url;
+                        else if (res.data.DownloadURL !== undefined) res.data.DownloadURL = built.url;
+                        else if (Array.isArray(res.data.dispatchList)) {
+                            res.data.dispatchList = Object.assign([], res.data.dispatchList, { 0: Object.assign({}, res.data.dispatchList[0] || {}, { prefix: '' }) });
+                            res.data.downloadPath = built.url;
+                        } else {
+                            res.data.DownloadUrl = built.url;
+                        }
+                        console.info('[123云盘解锁] 下载直链已就绪（' + built.shape + '）');
+                    } catch (e) {
+                        console.warn('[123云盘解锁] 直链写回失败', e);
+                    }
+                }
+                return res;
+            }
+        },
+        {
+            // 屏蔽数据收集请求
+            runat: "start",
+            match: (url) => url.pathname.includes('web_logs') || url.pathname.includes('metrics'),
+            condition: () => true,
+            action: () => {
+                const blocked = new Error('【123云盘解锁】已屏蔽此数据收集器');
+                blocked.silentAbort = true;
+                throw blocked;
+            }
+        }
+    ];
+
+    // 工具函数
+    /**
+     * 从下载类响应中解析出直链。
+     * 兼容两种形态：
+     *   1) 2026 版：{ data: { dispatchList: [{ prefix }], downloadPath, FileID } }
+     *   2) 旧版：  { data: { DownloadUrl | DownloadURL } }
+     * 返回 { url, shape } 或 null。
+     */
+    function buildDownloadUrlFromResponse(res) {
+        const data = res && res.data ? res.data : null;
+        if (!data) return null;
+
+        if (typeof data.DownloadUrl === 'string' && data.DownloadUrl) {
+            return { url: normalizeDownloadUrl(data.DownloadUrl), shape: 'DownloadUrl' };
+        }
+        if (typeof data.DownloadURL === 'string' && data.DownloadURL) {
+            return { url: normalizeDownloadUrl(data.DownloadURL), shape: 'DownloadURL' };
+        }
+
+        const list = data.dispatchList || data.DispatchList;
+        if (Array.isArray(list) && list.length && (data.downloadPath || data.DownloadPath)) {
+            const prefix = list[0].prefix || list[0].Prefix || '';
+            const path = data.downloadPath || data.DownloadPath;
+            if (prefix || path) {
+                return { url: normalizeDownloadUrl(prefix + path), shape: 'dispatchList+downloadPath' };
+            }
+        }
+        if (typeof data.downloadPath === 'string' && /^https?:\/\//.test(data.downloadPath)) {
+            return { url: normalizeDownloadUrl(data.downloadPath), shape: 'downloadPath' };
+        }
+        return null;
+    }
+
+    /** 规整直链：去掉自动跳转包装；旧 web-pro 网关换 web-pro2 直取 */
+    function normalizeDownloadUrl(raw) {
+        let origURL;
+        try {
+            origURL = new URL(raw);
+        } catch (e) {
+            return raw;
+        }
+        try {
+            if (origURL.origin.includes('web-pro')) {
+                origURL.searchParams.set('auto_redirect', 0);
+                return decodeURIComponent(origURL.href);
+            }
+            origURL.searchParams.set('auto_redirect', 0);
+            return decodeURIComponent(origURL.href);
+        } catch (e) {
+            return raw;
+        }
+    }
+
+    /**
+     * 分享页 shareKey：路径最后一段（例如 /123pan/GRNiVv-C77m3）。
+     * 站点自己的内联脚本 getShareKey() 还会去掉 .html 后缀、并排除路由段，
+     * 这里保持一致 —— 否则 /s/xxxx.html 这类链接会拿到带后缀的 key，服务端直接判无效。
+     */
+    function currentShareKey() {
+        const segs = location.pathname.split('/').filter(Boolean);
+        let k = segs.length ? segs[segs.length - 1] : '';
+        k = String(k).replace(/\.html$/i, '');
+        if (k === '123pan' || k === 's' || k === 'mshare' || k === 'share') {
+            k = segs.length > 1 ? segs[segs.length - 2] : k;
+        }
+        return k;
+    }
+
+    /**
+     * 取当前登录令牌：123 云盘的登录态**不在 cookie 里**，而在 localStorage 的
+     * authorToken（可能被存成带引号的 JSON 字符串），请求时以
+     * `Authorization: Bearer <token>` 发出（2026-10 实测）。
+     */
+    function getAuthToken() {
+        const keys = ['authorToken', 'token', 'accessToken'];
+        for (const k of keys) {
+            let raw = null;
+            // 站点在「不记住我」时会把令牌写进 sessionStorage，并删掉 localStorage 的同名键
+            // （分享页内联脚本：remember==='no' -> sessionStorage）。只查 localStorage 会把
+            // 已登录用户误判成未登录。两处都查。
+            try { raw = localStorage.getItem(k); } catch (e) { raw = null; }
+            if (!raw) { try { raw = sessionStorage.getItem(k); } catch (e) { raw = null; } }
+            if (!raw) continue;
+            let tok = raw;
+            try { const j = JSON.parse(raw); if (typeof j === 'string') tok = j; } catch (e) { }
+            tok = String(tok).replace(/^"|"$/g, '').trim();
+            if (tok) return tok;
+        }
+        return '';
+    }
+
+    /**
+     * 提取码（4 位）。123 云盘的分享可以设提取码；此时服务端只认 SharePwd 参数，
+     * 只带 ShareKey 会回 5103「提取码错误」。2026-10-08 VM 实测：
+     *   不带 SharePwd -> code=5103 提取码错误；带正确 SharePwd -> code=0 并返回文件列表。
+     *
+     * 来源按可信度排序：
+     *   1) localStorage['sharePwdd_' + shareKey] —— 站点自己在分享页把 URL 的 ?pwd= 存进这里
+     *      （内联脚本早于 getLogin.js 执行），最权威；
+     *   2) 当前 URL 的 ?pwd=；
+     *   3) 常见键名 SharePwd / sharePwd / share_code / pwd（含 sessionStorage）；
+     *   4) 页面上的提取码输入框（用户刚敲进去、页面还没接管时）。
+     */
+    function getSharePwd(shareKey) {
+        const clean = (v) => String(v == null ? '' : v).replace(/^[\"']|[\"']$/g, '').trim();
+        const looksLikePwd = (v) => /^[A-Za-z0-9]{4}$/.test(v) && !/^\d{3}$/.test(v);
+        try {
+            if (shareKey) {
+                // 实测站点两个键名并存，值相同；都试，提高容错
+                for (const prefix of ['sharePwdd_', 'sharePwd_']) {
+                    const v = localStorage.getItem(prefix + shareKey) || sessionStorage.getItem(prefix + shareKey);
+                    if (v) { const t = clean(v); if (t) return t; }
+                }
+            }
+        } catch (e) { }
+        try {
+            const p = new URLSearchParams(location.search).get('pwd');
+            if (p) { const t = clean(p); if (t) return t; }
+        } catch (e) { }
+        for (const k of ['SharePwd', 'sharePwd', 'share_code', 'pwd']) {
+            try {
+                const v = localStorage.getItem(k) || sessionStorage.getItem(k);
+                if (v) { const t = clean(v); if (t) return t; }
+            } catch (e) { }
+        }
+        // 兜底：只认「看得见的、确实像提取码」的输入框。
+        // 曾经扫全页任意 input 的 value，结果把别的浏览器扩展的隐藏字段
+        // （实测 #nopic-pf-maxW = 9999，图片最大宽高）当成提取码，
+        // 于是回吐「提取码不正确（当前读到 9999）」，把人指去改一个根本没输错的码。
+        try {
+            const PWD_FIELD_HINT = /提取码|提取密码|访问码|访问密码|密码|pwd|password|passcode/i;
+            const nodes = document.querySelectorAll('input');
+            for (const el of nodes) {
+                if (!el.offsetWidth && !el.offsetHeight) continue;   // 隐藏字段一律不算
+                if (el.closest('#vip-settings-panel, .settings-panel')) continue; // 别读自己的面板
+                const type = String(el.type || '').toLowerCase();
+                const hint = [el.placeholder, el.getAttribute('aria-label'), el.id, el.name, String(el.className || '')].join(' ');
+                if (type !== 'password' && !PWD_FIELD_HINT.test(hint)) continue;
+                const v = (el.value || '').trim();
+                if (looksLikePwd(v)) return v;
+            }
+        } catch (e) { }
+        return '';
+    }
+
+    /** 提取码提示：给用户能照着做的话，而不是干巴巴的「提取码错误」 */
+    function pwdHint(shareKey) {
+        const pwd = getSharePwd(shareKey);
+        if (pwd) {
+            return '提取码不正确（当前读到 ' + pwd + '）—— 请在页面上重新输入提取码，或改用带 ?pwd=xxxx 的完整链接打开';
+        }
+        return '这个分享设了提取码：请用带 ?pwd=xxxx 的完整链接打开本页，或先在页面上输入提取码再点提取';
+    }
+
+    /** 把 SharePwd 并进载荷；分享没设提取码时原样返回，不多带字段 */
+    function withSharePwd(shareKey, payload) {
+        const p = getSharePwd(shareKey);
+        return p ? Object.assign({}, payload, { SharePwd: p }) : payload;
+    }
+
+    /** 带令牌的请求头（没有令牌就退化成纯 cookie 请求） */
+    function authHeader() {
+        const tok = getAuthToken();
+        return tok ? { 'Authorization': 'Bearer ' + tok } : {};
+    }
+    /**
+     * 同源 fetch 兜底。站点 API 与页面同源，Authorization 头同源可发、
+     * credentials 带上 cookie，因此与 GM_xmlhttpRequest 等价。
+     */
+    /**
+     * 下载类接口要带 App 侧标识。
+     *
+     * 服务端对同一份文件：带 platform=android 走 App 侧应答（放行），
+     * 不带或 platform=web 走 web 侧应答（分享方的提取流量包闸门生效，
+     * 返回 5113「分享方提取流量包不足」）。产物里的 rules 本来就有这条，
+     * 但它只挂在页面 fetch 的补丁上，而本脚本自己发请求走 GM_xmlhttpRequest，
+     * 从来没带上 —— 所以那条规则对自己的调用是无效的。
+     */
+    const APP_PLATFORM_PATHS = [
+        '/v2/share/download/info',
+        '/v2/file/batch_download_share_info',
+        'share/download-list',
+        'file/download_info',
+        'file/batch_download_info'
+    ];
+    function appHeaders(url) {
+        const u = String(url || '');
+        for (let i = 0; i < APP_PLATFORM_PATHS.length; i++) {
+            if (u.indexOf(APP_PLATFORM_PATHS[i]) !== -1) return { platform: 'android' };
+        }
+        return {};
+    }
+
+    function gmRequestViaFetch(method, url, body, resolve) {
+        try {
+            fetch(url, {
+                method: method,
+                headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                body: body ? JSON.stringify(body) : undefined,
+                credentials: 'include'
+            }).then((r) => r.text().then((t) => {
+                let parsed = null;
+                try { parsed = JSON.parse(t); } catch (e) { parsed = null; }
+                resolve({ status: r.status, json: parsed, text: t });
+            })).catch((e) => resolve({ status: 0, json: null, text: String(e) }));
+        } catch (e) {
+            resolve({ status: 0, json: null, text: String(e) });
+        }
+    }
+
+    function gmRequest(method, url, body) {
+        return new Promise((resolve) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                // 手机浏览器常不实现 GM_xmlhttpRequest。站点 API 与页面同源，
+                // 用 fetch 等价替代（Authorization 同源可发，credentials 带上 cookie）。
+                try {
+                    fetch(url, {
+                        method: method,
+                        headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                        body: body ? JSON.stringify(body) : undefined,
+                        credentials: 'include'
+                    }).then((r) => r.text().then((t) => {
+                        let parsed = null;
+                        try { parsed = JSON.parse(t); } catch (e) { parsed = null; }
+                        resolve({ status: r.status, json: parsed, text: t });
+                    })).catch((e) => resolve({ status: 0, json: null, text: String(e) }));
+                } catch (e) {
+                    resolve({ status: 0, json: null, text: String(e) });
+                }
+                return;
+            }
+            try {
+                GM_xmlhttpRequest({
+                    method: method,
+                    url: url,
+                    data: body ? JSON.stringify(body) : undefined,
+                    headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                    withCredentials: true,
+                    timeout: 30000,
+                    onload: (r) => {
+                        let parsed = null;
+                        try { parsed = JSON.parse(r.responseText); } catch (e) { parsed = null; }
+                        resolve({ status: r.status, json: parsed, text: r.responseText });
+                    },
+                    onerror: () => resolve({ status: 0, json: null, text: 'GM_xmlhttpRequest error' }),
+                    ontimeout: () => resolve({ status: 0, json: null, text: 'timeout' })
+                });
+            } catch (e) {
+                // 引擎的 GM_xmlhttpRequest **存在、但一调用就抛**：实测 M浏览器 3.2.4.0706 的
+                // GM_xmlhttpRequest 内部要调 window.webmx.xmlhttprequest，而该桥未注入到页面
+                // 上下文 -> 同步 TypeError。此前这里直接把 status 0 抛给上层，于是
+                // 「提取当前分享直链」报「未取到可下载文件（0）」。改为降级同源 fetch。
+                gmRequestViaFetch(method, url, body, resolve);
+            }
+        });
+    }
+
+    /** 服务端状态快照（供控制台诊断与自动化验收读取，不参与任何伪造） */
+    const pan123State = {
+        version: '1.3.6',
+        shareKey: '',
+        loggedIn: null,        // true/false/null(未知)
+        visitor: null,         // GET /api/share/visitor/info 原文
+        trafficCheck: null,    // POST /api/share/download/traffic/check 的服务端原文 data
+        files: null,
+        listDebug: null,
+        lastListVia: null,
+        hook: null,
+        rawListLen: null,
+        filteredLen: null,
+        diagnose: null,
+        lastLink: null,
+        lastResult: null,
+        updatedAt: 0
+    };
+
+    /**
+     * 登录态判定：GET /api/share/visitor/info，**必须带 Authorization: Bearer**。
+     * 2026-10 实测：站点的登录态存在 localStorage.authorToken（值可能是带引号的 JSON 字符串），
+     * 请求以 `Authorization: Bearer <token>` 发出；只看 cookie 会被服务端判成
+     * 「cookie token is empty」，把已登录用户误报为未登录，并把取链请求打成 5112。
+     */
+    async function detectLoginState() {
+        const r = await gmRequest('GET', location.origin + '/api/share/visitor/info');
+        const j = r.json;
+        pan123State.visitor = j || { status: r.status, text: (r.text || '').slice(0, 200) };
+        pan123State.loggedIn = !!(j && j.code === 0);
+        pan123State.hasToken = !!getAuthToken();
+        if (pan123State.loggedIn && j && j.data) {
+            pan123State.user = {
+                Nickname: j.data.Nickname,
+                UID: j.data.UID,
+                Vip: !!j.data.Vip
+            };
+        }
+        pan123State.updatedAt = Date.now();
+        return pan123State.loggedIn;
+    }
+
+    /**
+     * 流量闸门原始状态：POST /api/share/download/traffic/check
+     * 载荷键名必须是 fileIds（数字数组），2026-10 实测：其它键名返回「请选择文件」。
+     * 返回 { isBlocked, isTrafficExceeded, isPay, originalRemainTraffic, cashierEnv, ... }
+     */
+    async function fetchTrafficCheck(shareKey, fileIds) {
+        const r = await gmRequest('POST', location.origin + '/api/share/download/traffic/check',
+            withSharePwd(shareKey, {
+                ShareKey: shareKey,
+                fileIds: (fileIds || []).map(Number)
+            }));
+        const d = (r.json && r.json.data) ? Object.assign({}, r.json.data) : null;
+        if (d) { delete d.origIsBlocked; delete d.origIsTrafficExceeded; }
+        pan123State.trafficCheck = d;
+        pan123State.updatedAt = Date.now();
+        return d;
+    }
+
+    /**
+     * 列分享文件：GET /api/share/get
+     * 必填参数（缺一个服务端就报 请输入X）：ShareKey、ParentFileId、Limit、
+     * OrderBy、OrderDirection、Next、Page。2026-10 实测。
+     */
+    /**
+     * 文件对象字段归一化：新版 /gsb/s/share-list 与旧版 /api/share/get 返回的
+     * 字段名大小写不一致（实测新版为 FileId/FileName/Size/Etag/S3KeyFlag/Type），
+     * 统一成上层主流程使用的这套大写键，避免取不到值被当成空清单。
+     */
+    function normalizeShareItem(it) {
+        if (!it || typeof it !== 'object') return null;
+        const pick = function () {
+            for (let i = 0; i < arguments.length; i++) {
+                const k = arguments[i];
+                if (it[k] !== undefined && it[k] !== null && it[k] !== '') return it[k];
+            }
+            return undefined;
+        };
+        // v1.3.3：不再因 FileId 缺失就丢弃整条 —— 新版接口的 ID 字段名可能与预期不同，
+        // 丢掉后上层只看到空清单，反而看不出真实结构。保留条目并挂 _raw 供诊断。
+        const fileId = pick('FileId', 'fileId', 'FileID', 'id', 'ID');
+        const sizeRaw = pick('Size', 'size', 'FileSize', 'fileSize');
+        const typeRaw = pick('Type', 'type', 'FileType', 'fileType', 'IsDir', 'isDir', 'dir');
+        return {
+            FileId: fileId || '',
+            FileName: pick('FileName', 'fileName', 'name', 'Name', 'Title', 'title') || '',
+            Size: Number(sizeRaw) || 0,
+            Type: Number(typeRaw) || 0,
+            Etag: pick('Etag', 'etag', 'ETag', 'eTag') || '',
+            S3KeyFlag: pick('S3KeyFlag', 's3KeyFlag', 'S3keyFlag', 's3keyFlag') || '',
+            _raw: it
+        };
+    }
+
+    /**
+     * 列分享文件（v1.3.2 修正）。
+     * 2026-10 实测：旧路径 /api/share/get 已不再返回清单，站点改用
+     *   GET /gsb/s/share-list?shareKey=...&SharePwd=...&OrderId=
+     *   返回 200，data 内为 { Next, Len, IsFirst, Expired, InfoList, IsPaidPreview }
+     * —— 文件列表就在 InfoList 里。此前只认 /api/share/get，故 files 恒为 0。
+     * 现在先试新路径，拿不到非空清单再回退旧路径（保留原七参数实现）。
+     */
+    async function listShareFiles(shareKey, parentFileId) {
+        const __pwd = getSharePwd(shareKey);
+        const norm = function (list) {
+            return (Array.isArray(list) ? list : []).map(normalizeShareItem).filter(Boolean);
+        };
+        // v1.3.4 关键修正：新版 /gsb/s/share-list 的请求串只有 shareKey/OrderId/SharePwd，
+        // **不接受 ParentFileId**。所以一旦进入子目录递归，它仍然返回"根目录"清单，
+        // 脚本就会在同一层反复找同一份列表，永远定位不到子目录里的文件，最终报
+        // 「逐级查找没定位到」。修正：非根目录一律优先走支持 ParentFileId 的旧路径。
+        const __pid = Number(parentFileId == null ? 0 : parentFileId);
+        const __isRoot = (__pid === 0);
+
+        // 子目录：先走旧路径 /api/share/get（唯一确认支持 ParentFileId 的）
+        if (!__isRoot) {
+            const qsSub = new URLSearchParams({
+                ShareKey: shareKey,
+                ParentFileId: String(__pid),
+                Limit: '100',
+                OrderBy: 'FileName',
+                OrderDirection: 'asc',
+                Next: '0',
+                Page: '1'
+            });
+            if (__pwd) qsSub.set('SharePwd', __pwd);
+            try {
+                const rs = await gmRequest('GET', location.origin + '/api/share/get?' + qsSub.toString());
+                const ds = (rs.json && rs.json.data) || {};
+                const ls = norm(ds.InfoList || ds.FileList || ds.infoList || ds.fileList);
+                if (ls.length) {
+                    pan123State.lastListVia = 'api/share/get(sub)';
+                    return { status: rs.status, code: rs.json && rs.json.code,
+                        message: rs.json && rs.json.message, list: ls, via: 'api/share/get(sub)' };
+                }
+            } catch (e) { }
+            // 旧路径无果，再试新路径并补上 ParentFileId（部分网关可能接受）
+            try {
+                const q1s = new URLSearchParams();
+                q1s.set('shareKey', shareKey);
+                q1s.set('OrderId', '');
+                q1s.set('SharePwd', __pwd || '');
+                q1s.set('ParentFileId', String(__pid));
+                const r1s = await gmRequest('GET', location.origin + '/gsb/s/share-list?' + q1s.toString());
+                const d1s = (r1s.json && r1s.json.data) || r1s.json || {};
+                const l1s = norm(d1s.InfoList || d1s.infoList || d1s.FileList || d1s.fileList);
+                if (l1s.length) {
+                    pan123State.lastListVia = 'gsb/s/share-list(sub)';
+                    return { status: r1s.status, code: r1s.json && r1s.json.code,
+                        message: r1s.json && r1s.json.message, list: l1s, via: 'gsb/s/share-list(sub)' };
+                }
+            } catch (e) { }
+            return { status: 0, code: -1, message: '子目录清单为空', list: [], via: 'sub-empty' };
+        }
+
+        // 路径 1（新）：/gsb/s/share-list —— 仅根目录使用
+        try {
+            const q1 = new URLSearchParams();
+            q1.set('shareKey', shareKey);
+            q1.set('OrderId', '');
+            q1.set('SharePwd', __pwd || '');
+            const r1 = await gmRequest('GET', location.origin + '/gsb/s/share-list?' + q1.toString());
+            const d1 = (r1.json && r1.json.data) || r1.json || {};
+            const list1 = norm(d1.InfoList || d1.infoList || d1.FileList || d1.fileList);
+            try {
+                pan123State.listDebug = {
+                    via: 'gsb/s/share-list',
+                    httpStatus: r1.status,
+                    code: r1.json && r1.json.code,
+                    message: r1.json && r1.json.message,
+                    dataKeys: d1 ? Object.keys(d1).slice(0, 12) : [],
+                    rawLen: Array.isArray(d1.InfoList) ? d1.InfoList.length
+                        : (Array.isArray(d1.infoList) ? d1.infoList.length : -1),
+                    firstKeys: (Array.isArray(d1.InfoList) && d1.InfoList[0])
+                        ? Object.keys(d1.InfoList[0]).slice(0, 20) : [],
+                    firstItem: (Array.isArray(d1.InfoList) && d1.InfoList[0]) ? d1.InfoList[0] : null,
+                    normalizedLen: list1.length
+                };
+            } catch (e) { }
+            if (list1.length) {
+                return {
+                    status: r1.status, code: r1.json && r1.json.code,
+                    message: r1.json && r1.json.message, list: list1, via: 'gsb/s/share-list'
+                };
+            }
+        } catch (e) { }
+
+        // 路径 2（旧）：/api/share/get，必填七参数，缺一个服务端报「请输入X」
+        const __qs = new URLSearchParams({
+            ShareKey: shareKey,
+            ParentFileId: String(parentFileId == null ? 0 : parentFileId),
+            Limit: '100',
+            OrderBy: 'FileName',
+            OrderDirection: 'asc',
+            Next: '0',
+            Page: '1'
+        });
+        // 有提取码才带：无码分享带空值会被服务端当成错码
+        if (__pwd) __qs.set('SharePwd', __pwd);
+        const r = await gmRequest('GET', location.origin + '/api/share/get?' + __qs.toString());
+        const d = (r.json && r.json.data) || {};
+        const list = norm(d.InfoList || d.FileList || d.infoList || d.fileList);
+        return {
+            status: r.status, code: r.json && r.json.code,
+            message: r.json && r.json.message, list: list, via: 'api/share/get'
+        };
+    }
+
+    /** 打开页面自带的登录入口（登录后即可走免费账号每月 10GB 提取流量） */
+    /** 站点登录入口（www.123pan.com/login 会 302 到 yun.123pan.cn/login，2026-10 实测） */
+    const LOGIN_URL = 'https://www.123pan.com/login';
+
+    /**
+     * 打开登录入口：优先点页面自带的「登录/注册」（桌面布局里实测是 button；手机版布局无此节点），
+     * 找不到就打开站点登录页。登录后即可走免费账号每月 10GB 提取流量。
+     */
+    function openLoginEntry() {
+        const names = ['登录/注册', '登录', '注册', '立即登录'];
+        const norm = (s) => (s || '').replace(/[\s\u00a0]+/g, '');
+        const cands = Array.from(document.querySelectorAll('button,a,div,span,li'));
+        const pick = cands.filter((n) => {
+            const t = norm(n.textContent);
+            if (!t) return false;
+            return names.indexOf(t) !== -1 || (t.indexOf('登录') !== -1 && t.length <= 8);
+        });
+        pick.sort((a, b) => {
+            const rank = (n) => (n.tagName === 'BUTTON' ? 0 : (n.tagName === 'A' ? 1 : 2));
+            return rank(a) - rank(b);
+        });
+        for (const node of pick) {
+            try {
+                node.click();
+                showFastLinkToast('已打开登录入口：登录后重新点「提取当前分享直链」', 'success', 6000);
+                return { ok: true, via: 'page:' + node.tagName };
+            } catch (e) { }
+        }
+        // 手机浏览器常拦截非手势上下文的 window.open（含 await 之后），失败就同页跳转。
+        try { if (!window.open(LOGIN_URL, '_blank')) location.href = LOGIN_URL; } catch (e) { location.href = LOGIN_URL; }
+        showFastLinkToast('页面没有登录节点（当前是手机版布局），已打开登录页：登录后回到分享页再点「提取当前分享直链」', 'warning', 8000);
+        return { ok: true, via: 'url:' + LOGIN_URL };
+    }
+
+    /**
+     * 提取当前分享文件的直链（2026 真实载荷）。
+     * 流程：GET /api/share/visitor/info 判登录态
+     *   -> GET /api/share/get 列文件（含 Etag，未登录时服务端可能不给）
+     *   -> POST /api/share/download/traffic/check 取闸门原始状态（只读展示，不改写）
+     *   -> POST /api/v2/file/batch_download_share_info（载荷 fileIdList:[{FileID,S3keyFlag,Size,Etag,OrderId}]）
+     *   -> 失败且有 Etag 时退回 POST /api/v2/share/download/info
+     * 拿到直链即复制剪贴板并拉起浏览器下载（不经转存、不写盘）。
+     */
+    /**
+     * 从某个目录起找第一个「真文件」（跳过文件夹），有界下钻。
+     * 分享的根目录经常只有一个文件夹（实测样本「新概念3李延隆版」），
+     * 旧逻辑按 Size>0 过滤会把文件夹当文件送去 batch —— 文件夹没有 Etag，
+     * 服务端直接拒（实测 400「已拦截」/ 5113）。
+     */
+    async function findFirstShareFile(shareKey, parentFileId, depth, budget) {
+        const pid = (parentFileId == null ? 0 : parentFileId);
+        budget.n = (budget.n || 0) + 1;
+        if (budget.n > 40 || depth > 5) return null;
+        const listed = await listShareFiles(shareKey, pid);
+        if (Number(listed.code) !== 0) return null;
+        const list = listed.list || [];
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1 && Number(list[i].Size) > 0) {
+                return { item: list[i], parentId: pid };
+            }
+        }
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1) continue;
+            const hit = await findFirstShareFile(shareKey, list[i].FileId, depth + 1, budget);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    async function extractDirectLink(opts) {
+        opts = opts || {};
+        const shareKey = opts.shareKey || currentShareKey();
+        const origin = location.origin;
+        if (!shareKey) return { ok: false, code: -1, reason: '未识别到分享 shareKey' };
+        pan123State.shareKey = shareKey;
+
+        const loggedIn = await detectLoginState();
+        const __parent = (opts.parentFileId == null ? 0 : opts.parentFileId);
+        const listed = await listShareFiles(shareKey, __parent);
+        // 只认真正的文件：文件夹 Type===1，没有 Etag，送去 batch 必被服务端拒
+        // v1.3.3：只排除「明确是文件夹」。原先还要求 Size > 0，一旦新接口不返回
+        // Size（或字段名不同），整个清单会被滤成空，上层只报「未取到可下载文件」。
+        let files = (listed.list || []).filter(f => Number(f.Type) !== 1);
+        pan123State.rawListLen = (listed.list || []).length;
+        pan123State.filteredLen = files.length;
+        if (!files.length && !opts.onlyName) {
+            const __first = await findFirstShareFile(shareKey, __parent, 0, { n: 0 });
+            if (__first) {
+                files = [__first.item];
+                pan123State.autoDrilled = true;
+            }
+        }
+        // v1.3.6：调用方已定位好条目（多选/单选都走这条），直接用，跳过列表与递归
+        if (opts.fileItems && opts.fileItems.length) {
+            files = opts.fileItems.slice();
+            pan123State.rawListLen = files.length;
+            pan123State.filteredLen = files.length;
+        }
+        if (opts.onlyName) {
+            const __hit = (listed.list || []).filter(f => String(f.FileName) === String(opts.onlyName));
+            if (!__hit.length) {
+                const reason = '当前文件夹里没有找到选中的文件「' + opts.onlyName + '」'
+                    + (listed.message ? '（' + listed.message + '）' : '');
+                pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'error', 6000);
+                return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+            }
+            if (Number(__hit[0].Type) === 1) {
+                const reason = '选中的是文件夹；请选中一个具体文件再提取直链';
+                showFastLinkToast(reason, 'warning', 5000);
+                return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            }
+            files = __hit;
+        }
+        pan123State.files = files.map(f => ({
+            FileID: f.FileId, FileName: f.FileName, Size: f.Size,
+            Etag: f.Etag || '', S3KeyFlag: f.S3KeyFlag
+        }));
+        if (!files.length) {
+            // 5103 = 提取码错误。这是分享设了提取码、而 SharePwd 缺失或不对，
+            // 不是「文件不存在」——必须给用户能照着做的提示。
+            const reason = (Number(listed.code) === 5103)
+                ? pwdHint(shareKey)
+                : ('未取到可下载文件（' + (listed.message || listed.status) + '）'
+                    + '｜原始清单 ' + (pan123State.rawListLen == null ? '?' : pan123State.rawListLen)
+                    + ' 条，过滤后 ' + (pan123State.filteredLen == null ? '?' : pan123State.filteredLen)
+                    + ' 条；详见控制台 __pan123Fix.state.listDebug');
+            pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+            showFastLinkToast('提取失败：' + reason, 'error', 6000);
+            return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+        }
+
+        const check = await fetchTrafficCheck(shareKey, files.map(f => f.FileId));
+        const results = [];
+
+        /* v1.3.6：多选打包分支。
+         * 选中多个文件时，向批量接口发**一次**请求（fileIdList 含全部文件），
+         * 服务端打包成 zip 返回单个直链。这比逐个提取更符合「点多文件打包」的预期。
+         */
+        if (files.length > 1 || opts.pack) {
+            const __idList = files.map(ff => ({
+                FileID: ff.FileId,
+                S3keyFlag: ff.S3KeyFlag || ff.S3keyFlag || '',
+                Size: ff.Size,
+                Etag: ff.Etag || '',
+                OrderId: ''
+            }));
+            const __bat = await gmRequest('POST', origin + '/api/v2/file/batch_download_share_info',
+                withSharePwd(shareKey, { ShareKey: shareKey, fileIdList: __idList }));
+            const __bj = __bat.json || {};
+            if (__bj.code === 0) {
+                const __b = buildDownloadUrlFromResponse(__bj);
+                if (__b) {
+                    const packedUrl = __b.url;
+                    results.push({
+                        file: '打包 ' + files.length + ' 个文件（zip）',
+                        fileId: 0, size: files.reduce((a, b) => a + (Number(b.Size) || 0), 0),
+                        etagPresent: true, url: packedUrl, shape: __b.shape,
+                        via: 'batch_download_share_info', code: 0, message: __bj.message,
+                        packed: true
+                    });
+                }
+            }
+            if (!results.length) {
+                results.push({
+                    file: '打包 ' + files.length + ' 个文件', fileId: 0, size: 0,
+                    etagPresent: false, url: null, shape: null,
+                    via: 'batch_download_share_info', code: __bj.code,
+                    message: __bj.message || '打包失败', packed: true
+                });
+            }
+        }
+
+        for (const f of files) {
+            let url = null, shape = null, via = null, code = null, message = null;
+
+            /* v1.3.6：单文件优先用单文件接口，拿到的是**原文件**直链；
+             * 批量接口会把单个文件也打成 zip。原实现先 batch 后单文件，
+             * 所以单文件提取拿到的也是压缩包。现在反过来。
+             */
+            if (f.Etag && files.length === 1 && !opts.pack) {
+                const __sg = await gmRequest('POST', origin + '/api/v2/share/download/info',
+                    withSharePwd(shareKey, {
+                        ShareKey: shareKey, FileID: f.FileId, S3keyFlag: f.S3KeyFlag || '',
+                        Size: f.Size, Etag: f.Etag, OrderId: ''
+                    }));
+                code = __sg.json && __sg.json.code;
+                message = __sg.json && __sg.json.message;
+                if (__sg.json && __sg.json.code === 0) {
+                    const __b1 = buildDownloadUrlFromResponse(__sg.json);
+                    if (__b1) { url = __b1.url; shape = __b1.shape; via = 'share/download/info'; }
+                }
+            }
+
+            const batch = await gmRequest('POST', origin + '/api/v2/file/batch_download_share_info',
+                withSharePwd(shareKey, {
+                    ShareKey: shareKey,
+                    fileIdList: [{
+                        FileID: f.FileId,
+                        S3keyFlag: f.S3KeyFlag || f.S3keyFlag || '',
+                        Size: f.Size,
+                        Etag: f.Etag || '',
+                        OrderId: ''
+                    }]
+                }));
+            // 单文件且已拿到原文件直链时，不再调批量接口（避免变成 zip）
+            if (url) {
+                // 保持 url 不变
+            } else {
+            code = batch.json && batch.json.code;
+            message = batch.json && batch.json.message;
+            if (batch.json && batch.json.code === 0) {
+                const b = buildDownloadUrlFromResponse(batch.json);
+                if (b) { url = b.url; shape = b.shape; via = 'batch_download_share_info'; }
+            }
+            }
+
+            if (!url && f.Etag) {
+                const single = await gmRequest('POST', origin + '/api/v2/share/download/info',
+                    withSharePwd(shareKey, {
+                        ShareKey: shareKey, FileID: f.FileId, S3keyFlag: f.S3KeyFlag || '',
+                        Size: f.Size, Etag: f.Etag, OrderId: ''
+                    }));
+                code = single.json && single.json.code;
+                message = single.json && single.json.message;
+                if (single.json && single.json.code === 0) {
+                    const b = buildDownloadUrlFromResponse(single.json);
+                    if (b) { url = b.url; shape = b.shape; via = 'share/download/info'; }
+                }
+            }
+
+            results.push({
+                file: f.FileName, fileId: f.FileId, size: f.Size, etagPresent: !!f.Etag,
+                url: url, shape: shape, via: via, code: code, message: message
+            });
+
+            if (url && !opts.all) break;
+        }
+
+        const got = results.filter(r => r.url);
+        if (got.length) {
+            const first = got[0];
+            try { GM_setClipboard(first.url, 'text'); } catch (e) { }
+            pan123State.lastLink = first.url;
+            pan123State.lastResult = { ok: true, code: 0, via: first.via, shape: first.shape, file: first.file, loggedIn: loggedIn };
+            var __tip = '直链已复制并开始下载：' + first.file
+                + (first.packed ? '（打包 zip）' : '（原文件，未打包）');
+            showFastLinkToast(__tip, first.packed ? 'warning' : 'success', 6000);
+            // extractDirectLink 是 async，await 之后手势上下文已丢失，手机端 window.open 多被拦截。
+            // 拦下就同页跳转，交给浏览器的下载管理器接管（直链此时已复制到剪贴板）。
+            if (!opts.noOpen) {
+                try { if (!window.open(first.url, '_blank')) location.href = first.url; }
+                catch (e) { location.href = first.url; }
+            }
+            return { ok: true, url: first.url, shape: first.shape, via: first.via, loggedIn: loggedIn, check: check, results: results };
+        }
+
+        const r0 = results[0] || {};
+        let reason;
+        if (r0.code === 5112) {
+            reason = loggedIn
+                ? '服务端 5112：当前账号免费提取流量已用尽，或该分享未开启分享流量包（VIP/提取流量包可解）'
+                : '服务端 5112「您需要注册登录或付费后下载」：未登录访客提取分享文件被拒。登录免费账号即可走每月 10GB 免费提取（本脚本不绕过服务端闸门，也不伪造成交）';
+        } else if (r0.code === 5113 || r0.code === 5114) {
+            reason = '服务端 ' + r0.code + '「' + (r0.message || '分享方提取流量包不足') + '」'
+                + '：分享者的提取流量包已用尽或未开启（需分享者开 VIP / 购买提取流量包，'
+                + '与下载者自己的配额无关）';
+        } else {
+            reason = (r0.message || '服务端未返回直链') + '（code ' + r0.code + '）';
+        }
+        if (!r0.etagPresent && !loggedIn) { reason += '｜该文件对未登录访客不下发 Etag，单文件接口无法调用'; }
+        if (!loggedIn) reason += '｜可用油猴菜单「🔑 打开登录入口」登录后重试（免费账号每月 10GB）';
+        pan123State.lastResult = { ok: false, code: r0.code, reason: reason, loggedIn: loggedIn };
+        showFastLinkToast('未能获取直链：' + reason, 'error', 9000);
+        return { ok: false, code: r0.code, reason: reason, loggedIn: loggedIn, check: check, results: results };
+    }
+
+    /**
+     * 下载状态诊断：登录态 + 流量闸门原文 + 直链可用性，一屏给出结论。
+     * 只读探测，不修改任何服务端状态。
+     */
+    async function diagnoseDownload() {
+        const shareKey = currentShareKey();
+        const loggedIn = await detectLoginState();
+        const listed = await listShareFiles(shareKey, 0);
+        const files = (listed.list || []).filter(f => Number(f.Type) !== 1 && Number(f.Size) > 0);
+        pan123State.files = files.map(f => ({
+            FileID: f.FileId, FileName: f.FileName, Size: f.Size,
+            Etag: f.Etag || '', S3KeyFlag: f.S3KeyFlag
+        }));
+        const check = await fetchTrafficCheck(shareKey, files.map(f => f.FileId));
+        const report = {
+            version: pan123State.version,
+            shareKey: shareKey,
+            loggedIn: loggedIn,
+            loginUrl: LOGIN_URL,
+            visitor: pan123State.visitor,
+            trafficCheck: check,
+            shareGet: { code: listed.code, message: listed.message, files: pan123State.files || [] },
+            conclusion: ''
+        };
+        if (!loggedIn) {
+            report.conclusion = '未登录：服务端对访客提取分享文件返回 5112，需登录（免费账号每月 10GB）';
+        } else if (check && check.isBlocked) {
+            report.conclusion = '已登录，但服务端闸门 isBlocked=true（免费提取流量用尽 / 该分享未开分享流量包）';
+        } else if (check) {
+            report.conclusion = '已登录且服务端闸门 isBlocked=false：可直接提取直链';
+        } else {
+            report.conclusion = '流量闸门接口未返回 data，请稍后重试';
+        }
+        pan123State.diagnose = report;
+        try { console.info('[123云盘解锁] 下载状态诊断', report); } catch (e) { }
+        showFastLinkToast('诊断：' + report.conclusion, (loggedIn && check && !check.isBlocked) ? 'success' : 'warning', 9000);
+        return report;
+    }
+
+    function findMatchingRule(url, phase) {
+        try {
+        return rules.find(rule =>
+            rule.match(url) &&
+            rule.condition() &&
+            rule.runat === phase
+        );
+        } catch (error) {
+            console.error('[123云盘解锁] 规则匹配失败:', error);
+            if (user.debug) {
+                console.error('错误详情:', { url: url.href, phase });
+            }
+            return null;
+        }
+    }
+
+    function processData(data) {
+        if (typeof data === 'string') {
+            try {
+                return JSON.parse(data);
+            } catch {
+                return data;
+            }
+        }
+        return data;
+    }
+
+    function debugLog(method, phase, url, original, modified) {
+        if (user.debug) {
+            console.log(`[123云盘解锁] ${method} ${phase}`, {
+                url: url.href,
+                original: original,
+                modified: modified
+            });
+        }
+    }
+
+    function applyRule(rule, data, url, method, phase) {
+        const originalData = processData(data);
+        let result = rule.action(originalData, url);
+
+        // 处理header格式化
+        if (phase === 'header' && result && typeof result === 'object') {
+            const headers = {};
+            Object.entries(result).forEach(([key, value]) => {
+                const formattedKey = key.toLowerCase()
+                    .split('-')
+                    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+                    .join('-');
+                headers[formattedKey] = value;
+            });
+            result = headers;
+        }
+
+        debugLog(method, phase, url, originalData, result);
+
+        // 非header返回字符串
+        if (phase !== 'header' && result && typeof result === 'object') {
+            return JSON.stringify(result);
+        }
+
+        return result;
+    }
+
+    // 统一错误处理包装函数
+    function safeApplyRule(rule, data, url, method, phase) {
+        try {
+            return applyRule(rule, data, url, method, phase);
+        } catch (error) {
+            // 设计性中止（例如遥测屏蔽规则）：不刷 error，行为与原来一致（返回 undefined -> 用空响应顶掉请求）
+            if (error && error.silentAbort) {
+                if (user.debug) console.info(`[123云盘解锁] 按设计中止此请求 [${phase}]:`, error.message);
+                return undefined;
+            }
+            console.error(`[123云盘解锁] 规则执行失败 [${phase}]:`, error);
+            if (user.debug) {
+                console.error('错误详情:', {
+                    url: url.href,
+                    method: method,
+                    phase: phase,
+                    stack: error.stack
+                });
+            }
+            // 返回原始数据以保证功能不中断
+            return data;
+        }
+    }
+
+    // 修复后的Fetch拦截（带统一错误处理）
+    unsafeWindow.fetch = async function (input, init = {}) {
+        try {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.origin);
+
+        // 检查start规则
+        const startRule = findMatchingRule(url, 'start');
+        if (startRule) {
+            try {
+                    const result = safeApplyRule(startRule, null, url, 'fetch', 'start');
+                return new Response(result, {
+                    status: 200,
+                    statusText: 'OK',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            } catch (error) {
+                console.warn('[123云盘解锁] fetch start错误:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+            }
+        }
+
+        // 检查header规则
+        const headerRule = findMatchingRule(url, 'header');
+        if (headerRule) {
+                try {
+            if (!init.headers) init.headers = {};
+
+            let headers = {};
+            if (init.headers instanceof Headers) {
+                init.headers.forEach((value, key) => headers[key] = value);
+            } else {
+                headers = { ...init.headers };
+            }
+
+                    const modifiedHeaders = safeApplyRule(headerRule, headers, url, 'fetch', 'header');
+            init.headers = new Headers(modifiedHeaders);
+                } catch (error) {
+                    console.warn('[123云盘解锁] fetch header错误:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+                }
+        }
+
+        // 执行原始请求
+        const response = await originalFetch.call(this, input, init);
+
+        // 检查end规则
+        const endRule = findMatchingRule(url, 'end');
+        if (endRule) {
+            try {
+                const responseText = await response.clone().text();
+                    const modifiedResponse = safeApplyRule(endRule, responseText, url, 'fetch', 'end');
+
+                return new Response(modifiedResponse, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                });
+            } catch (error) {
+                console.warn('[123云盘解锁] fetch end错误:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+            }
+        }
+
+        return response;
+        } catch (error) {
+            console.error('[123云盘解锁] fetch拦截失败:', error);
+            if (user.debug) {
+                console.error('错误堆栈:', error.stack);
+            }
+            // 失败时调用原始fetch
+            return originalFetch.call(this, input, init);
+        }
+    };
+
+    // 修复后的XMLHttpRequest拦截（修复内存泄漏）
+    XMLHttpRequest.prototype.open = function (method, url, ...args) {
+        try {
+        const fullUrl = new URL(url, location.origin);
+        this[requestURLSymbol] = fullUrl;
+
+            // 移除旧的事件监听器（如果存在）
+            if (this[handlerSymbol]) {
+                this.removeEventListener('readystatechange', this[handlerSymbol]);
+            }
+
+        // 使用箭头函数保持this上下文
+        const handleStateChange = () => {
+            if (this.readyState === 4) {
+                const endRule = findMatchingRule(fullUrl, 'end');
+                if (endRule) {
+                    try {
+                            const modifiedResponse = safeApplyRule(
+                            endRule,
+                            this.responseText,
+                            fullUrl,
+                            'XHR',
+                            'end'
+                        );
+
+                        Object.defineProperty(this, 'responseText', {
+                            value: modifiedResponse,
+                            writable: false,
+                            configurable: true
+                        });
+
+                        Object.defineProperty(this, 'response', {
+                            value: modifiedResponse,
+                            writable: false,
+                            configurable: true
+                        });
+                    } catch (error) {
+                            console.warn('[123云盘解锁] XHR响应处理错误:', error);
+                            if (user.debug) {
+                                console.error('错误堆栈:', error.stack);
+                            }
+                    }
+                }
+            }
+        };
+
+            // 保存事件处理器引用，以便后续移除
+            this[handlerSymbol] = handleStateChange;
+        this.addEventListener('readystatechange', handleStateChange);
+
+        return originalOpen.call(this, method, url, ...args);
+        } catch (error) {
+            console.error('[123云盘解锁] XHR.open错误:', error);
+            if (user.debug) {
+                console.error('错误堆栈:', error.stack);
+            }
+            // 失败时调用原始方法
+            return originalOpen.call(this, method, url, ...args);
+        }
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        try {
+        const url = this[requestURLSymbol];
+        if (!url) return originalSetRequestHeader.call(this, name, value);
+
+        const headerRule = findMatchingRule(url, 'header');
+        if (headerRule) {
+                try {
+            if (!this[modifiedHeadersSymbol]) this[modifiedHeadersSymbol] = {};
+            this[modifiedHeadersSymbol][name] = value;
+
+                    const modifiedHeaders = safeApplyRule(headerRule, this[modifiedHeadersSymbol], url, 'XHR', 'header');
+            this[modifiedHeadersSymbol] = modifiedHeaders;
+            return;
+                } catch (error) {
+                    console.warn('[123云盘解锁] XHR header处理错误:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+                }
+        }
+
+        return originalSetRequestHeader.call(this, name, value);
+        } catch (error) {
+            console.error('[123云盘解锁] XHR.setRequestHeader错误:', error);
+            if (user.debug) {
+                console.error('错误堆栈:', error.stack);
+            }
+            // 失败时调用原始方法
+            return originalSetRequestHeader.call(this, name, value);
+        }
+    };
+
+    XMLHttpRequest.prototype.send = function (data) {
+        try {
+        const url = this[requestURLSymbol];
+        if (!url) return originalSend.call(this, data);
+
+        // 应用修改的headers
+        const modifiedHeaders = this[modifiedHeadersSymbol];
+        if (modifiedHeaders) {
+                try {
+            Object.entries(modifiedHeaders).forEach(([name, value]) => {
+                originalSetRequestHeader.call(this, name, value);
+            });
+                } catch (error) {
+                    console.warn('[123云盘解锁] 应用修改的headers失败:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+                }
+        }
+
+        // 检查start规则
+        const startRule = findMatchingRule(url, 'start');
+        if (startRule) {
+            try {
+                    const result = safeApplyRule(startRule, null, url, 'XHR', 'start');
+
+                // 设置响应属性
+                Object.defineProperty(this, 'readyState', {
+                    value: 4,
+                    configurable: true
+                });
+                Object.defineProperty(this, 'status', {
+                    value: 200,
+                    configurable: true
+                });
+                Object.defineProperty(this, 'responseText', {
+                    value: result,
+                    configurable: true
+                });
+                Object.defineProperty(this, 'response', {
+                    value: result,
+                    configurable: true
+                });
+
+                // 触发事件
+                setTimeout(() => {
+                    ['readystatechange', 'load', 'loadend'].forEach(eventType => {
+                        try {
+                            this.dispatchEvent(new Event(eventType));
+                            const handler = this[`on${eventType}`];
+                            if (typeof handler === 'function') handler.call(this);
+                        } catch (error) {
+                            console.warn(`[123云盘解锁] 事件错误 ${eventType}:`, error);
+                                if (user.debug) {
+                                    console.error('错误堆栈:', error.stack);
+                                }
+                        }
+                    });
+                }, 0);
+
+                return;
+            } catch (error) {
+                    console.warn('[123云盘解锁] XHR start处理错误:', error);
+                    if (user.debug) {
+                        console.error('错误堆栈:', error.stack);
+                    }
+            }
+        }
+
+        return originalSend.call(this, data);
+        } catch (error) {
+            console.error('[123云盘解锁] XHR.send错误:', error);
+            if (user.debug) {
+                console.error('错误堆栈:', error.stack);
+            }
+            // 失败时调用原始方法
+            return originalSend.call(this, data);
+        }
+    };
+
+    // 格式化设置项
+    const formatSetting = (key, value, comment) => {
+        const item = document.createElement('div');
+        item.className = 'setting-item';
+
+        const content = document.createElement('div');
+        content.className = 'setting-content';
+
+        const keyElement = document.createElement('div');
+        keyElement.className = 'setting-key';
+        keyElement.textContent = key;
+        content.appendChild(keyElement);
+
+        // 判断设置类型 - 修复等级1被误判为开关的问题
+        const switchKeys = ['VIP状态', 'SVIP显示', '长期会员显示', '广告控制', '秒传功能', '调试模式'];
+        const isSwitch = switchKeys.includes(key) && typeof value === 'number' && (value === 0 || value === 1);
+        const isEditable = ['用户名', '头像', '等级', '过期时间'].includes(key);
+
+        if (isSwitch) {
+            // 创建开关按钮
+            const switchContainer = document.createElement('label');
+            switchContainer.className = 'switch';
+
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = value === 1;
+
+            const slider = document.createElement('span');
+            slider.className = 'slider round';
+
+            switchContainer.appendChild(input);
+            switchContainer.appendChild(slider);
+
+            // 添加点击事件
+            input.addEventListener('change', () => {
+                let newValue = input.checked ? 1 : 0;
+                // 更新用户配置
+                switch (key) {
+                    case 'VIP状态':
+                        user.vip = newValue;
+                        GM_setValue('vip', newValue);
+                        break;
+                    case 'SVIP显示':
+                        user.svip = newValue;
+                        GM_setValue('svip', newValue);
+                        // 如果SVIP关闭，长期会员也应该关闭
+                        if (newValue === 0 && user.pvip === 1) {
+                            user.pvip = 0;
+                            GM_setValue('pvip', 0);
+                        }
+                        break;
+                    case '长期会员显示':
+                        user.pvip = newValue;
+                        GM_setValue('pvip', newValue);
+                        // 如果长期会员开启，SVIP必须开启
+                        if (newValue === 1 && user.svip === 0) {
+                            user.svip = 1;
+                            GM_setValue('svip', 1);
+                        }
+                        break;
+                    case '广告控制':
+                        user.ad = newValue;
+                        GM_setValue('ad', newValue);
+                        break;
+                    case '秒传功能':
+                        FastLinkConfig.enabled = newValue;
+                        GM_setValue('fastlink_enabled', newValue);
+                        break;
+                    case '调试模式':
+                        user.debug = newValue;
+                        GM_setValue('debug', newValue);
+                        break;
+                }
+
+                // 刷新页面以应用更改
+                setTimeout(() => location.reload(), 300);
+            });
+
+            content.appendChild(switchContainer);
+        } else if (isEditable) {
+            // 创建输入框
+            const inputContainer = document.createElement('div');
+            inputContainer.className = 'input-container';
+
+            const inputElement = document.createElement('input');
+
+            // 根据不同的设置项设置输入框类型和属性
+            if (key === '等级') {
+                inputElement.type = 'number';
+                inputElement.min = 0;
+                inputElement.max = 128;
+                inputElement.value = value;
+            } else if (key === '过期时间') {
+                inputElement.type = 'datetime-local';
+                // 将时间戳转换为datetime-local格式
+                const date = new Date(value * 1000);
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                const hours = String(date.getHours()).padStart(2, '0');
+                const minutes = String(date.getMinutes()).padStart(2, '0');
+                inputElement.value = `${year}-${month}-${day}T${hours}:${minutes}`;
+            } else {
+                inputElement.type = 'text';
+                inputElement.value = value;
+            }
+
+            inputElement.className = 'setting-input';
+
+            // 添加保存按钮
+            const saveButton = document.createElement('button');
+            saveButton.textContent = '保存';
+            saveButton.className = 'save-btn';
+
+            // 保存按钮点击事件
+            saveButton.addEventListener('click', () => {
+                let newValue = inputElement.value;
+
+                // 验证和转换不同类型的输入
+                if (key === '等级') {
+                    newValue = parseInt(newValue);
+                    if (isNaN(newValue) || newValue < 0 || newValue > 128) {
+                        alert('等级必须在 0-128 之间');
+                        return;
+                    }
+                } else if (key === '过期时间') {
+                    // 将datetime-local格式转换为时间戳
+                    const date = new Date(newValue);
+                    if (isNaN(date.getTime())) {
+                        alert('请输入有效的日期时间');
+                        return;
+                    }
+                    newValue = Math.floor(date.getTime() / 1000);
+                } else if (key === '头像' && newValue && !newValue.match(/^https?:\/\/.+/)) {
+                    if (!confirm('头像URL似乎不是有效的HTTP/HTTPS地址，是否继续保存？')) {
+                        return;
+                    }
+                }
+
+                // 更新配置
+                switch (key) {
+                    case '用户名':
+                        user.name = newValue;
+                        GM_setValue('name', newValue);
+                        break;
+                    case '头像':
+                        user.photo = newValue;
+                        GM_setValue('photo', newValue);
+                        break;
+                    case '等级':
+                        user.level = newValue;
+                        GM_setValue('level', newValue);
+                        break;
+                    case '过期时间':
+                        user.endtime = newValue;
+                        GM_setValue('endtime', newValue);
+                        break;
+                }
+
+                // 显示保存成功提示
+                saveButton.textContent = '已保存';
+                saveButton.classList.add('saved');
+                setTimeout(() => {
+                    saveButton.textContent = '保存';
+                    saveButton.classList.remove('saved');
+                    location.reload();
+                }, 1500);
+            });
+
+            inputContainer.appendChild(inputElement);
+            inputContainer.appendChild(saveButton);
+            content.appendChild(inputContainer);
+        } else {
+            // 非编辑项的显示
+            const valueElement = document.createElement('div');
+            valueElement.className = 'setting-value';
+            valueElement.textContent = key === '过期时间' ? new Date(value * 1000).toLocaleString() : value;
+            content.appendChild(valueElement);
+        }
+
+        item.appendChild(content);
+
+        if (comment) {
+            const commentElement = document.createElement('div');
+            commentElement.className = 'setting-comment';
+            commentElement.textContent = comment;
+            item.appendChild(commentElement);
+        }
+
+        return item;
+    };
+
+    function createSettingsPanel() {
+        // 检查是否已存在面板
+        if (document.getElementById('vip-settings-panel')) {
+            return;
+        }
+
+        // 创建面板容器
+        const panel = document.createElement('div');
+        panel.id = 'vip-settings-panel';
+        panel.className = 'settings-panel';
+
+        // 创建标题栏
+        const header = document.createElement('div');
+        header.className = 'panel-header';
+
+        // 创建标题容器
+        const titleContainer = document.createElement('div');
+        titleContainer.className = 'title-container';
+
+        const title = document.createElement('h3');
+        title.textContent = '123云盘脚本设置';
+        titleContainer.appendChild(title);
+
+        // 添加GitHub图标
+        const githubIcon = document.createElement('a');
+        githubIcon.href = 'https://github.com/hawchou1995/123pan_unlock';
+        githubIcon.target = '_blank';
+        githubIcon.className = 'github-icon';
+        githubIcon.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style="image-rendering: -webkit-optimize-contrast; image-rendering: crisp-edges; shape-rendering: geometricPrecision;">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+            </svg>
+        `;
+        githubIcon.title = '访问GitHub项目';
+        titleContainer.appendChild(githubIcon);
+
+        header.appendChild(titleContainer);
+
+        // 添加关闭按钮
+        const closeButton = document.createElement('button');
+        closeButton.className = 'close-btn';
+        closeButton.innerHTML = '&times;';
+        closeButton.addEventListener('click', () => panel.remove());
+        header.appendChild(closeButton);
+
+        panel.appendChild(header);
+
+        // 创建设置列表
+        const settingsList = document.createElement('div');
+        settingsList.className = 'settings-list';
+
+        // 添加所有设置项
+        const settings = [
+            { key: 'VIP状态', value: user.vip, comment: '会员修改总开关' },
+            { key: 'SVIP显示', value: user.svip, comment: '显示为超级会员 (关闭将自动关闭长期会员)' },
+            { key: '长期会员显示', value: user.pvip, comment: '显示为长期会员 (开启将自动开启 SVIP 显示)' },
+            { key: '广告控制', value: user.ad, comment: '关闭广告' },
+            { key: '秒传功能', value: FastLinkConfig.enabled, comment: '启用秒传链接生成和保存功能' },
+            { key: '用户名', value: user.name, comment: '自定义用户名（支持中文、英文、数字）' },
+            { key: '头像', value: user.photo, comment: '自定义头像URL（建议使用HTTPS地址）' },
+            { key: '等级', value: user.level, comment: '成长容量等级（0-128，数字越大容量越大）' },
+            { key: '过期时间', value: user.endtime, comment: '会员过期时间（可自定义任意时间）' },
+            { key: '下载校验接管', value: user.bypassCheck, comment: '接管 share/download/traffic/check（服务端仍会给出最终结论）' },
+            { key: '直链提取', value: user.directLink, comment: '允许按当前接口提取下载直链' },
+            { key: '调试模式', value: user.debug, comment: '调试信息显示级别' }
+        ];
+
+        settings.forEach(setting => {
+            settingsList.appendChild(formatSetting(setting.key, setting.value, setting.comment));
+        });
+
+        panel.appendChild(settingsList);
+
+        // 添加交流群按钮
+        const groupButton = document.createElement('a');
+        groupButton.href = 'https://qingju.me';
+        groupButton.target = '_blank';
+        groupButton.className = 'group-btn';
+        groupButton.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+            </svg>
+            <span>访问论坛 qingju.me</span>
+        `;
+        panel.appendChild(groupButton);
+
+        // 移动端触发入口：脚本菜单（GM_registerMenuCommand）在手机浏览器上
+        // 支持最不稳定，而这枚 ⚙️ 按钮是无条件创建的，所以在这里兜底放一个入口。
+        // 复用现有 .group-btn 样式，不新增 CSS。
+        const directLinkButton = document.createElement('button');
+        directLinkButton.className = 'group-btn';
+        directLinkButton.innerHTML = '<span>⬇️ 提取当前分享直链</span>';
+        directLinkButton.addEventListener('click', function () {
+            panel.remove();
+            if (user.directLink !== 1) {
+                showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+                return;
+            }
+            extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+        });
+        panel.appendChild(directLinkButton);
+
+        document.body.appendChild(panel);
+    }
+
+    /**
+     * 绑定「hover 展开的下拉菜单」，触屏上改成点按展开（1.2.7）。
+     * 手机没有 hover：原实现只有 mouseenter/mouseleave，点按按钮会同时触发
+     * mouseenter 与业务 click，菜单要么弹不出来、要么弹出后永不收起，
+     * 「复制JSON / 导出失败链接」这些二级项在手机上根本点不到。
+     * 逻辑：触屏下首次点按只展开菜单并拦掉业务动作（捕获阶段），
+     * 菜单已展开时放行第二次点按；桌面端行为与原来完全一致。
+     */
+    function bindTapDropdown(btn, hoverRoot, menu) {
+        if (IS_TOUCH) {
+            btn.addEventListener('click', function (e) {
+                if (menu.style.display !== 'block') {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    menu.style.display = 'block';
+                }
+            }, true);
+            document.addEventListener('click', function (e) {
+                if (!hoverRoot.contains(e.target)) menu.style.display = 'none';
+            });
+            return;
+        }
+        btn.addEventListener('mouseenter', function () { menu.style.display = 'block'; });
+        hoverRoot.addEventListener('mouseleave', function () { menu.style.display = 'none'; });
+    }
+
+    // 秒传功能UI函数
+    function showFastLinkToast(message, type = 'info', duration = 3000) {
+        const toast = document.createElement('div');
+        toast.className = 'fastlink-toast';
+        toast.style.cssText = `
+            position: fixed;
+            top: calc(20px + env(safe-area-inset-top, 0px));
+            right: calc(20px + env(safe-area-inset-right, 0px));
+            background: #fff;
+            color: #333;
+            padding: 12px 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            z-index: 10002;
+            font-size: 14px;
+            max-width: 300px;
+            animation: fastlinkToastSlideIn 0.3s ease-out;
+        `;
+        
+        // 根据类型设置边框颜色
+        const borderColors = {
+            success: '#4CAF50',
+            error: '#f44336',
+            warning: '#ff9800',
+            info: '#2196F3'
+        };
+        toast.style.borderLeft = `4px solid ${borderColors[type] || borderColors.info}`;
+        toast.textContent = message;
+        
+        document.body.appendChild(toast);
+        
+        setTimeout(() => {
+            toast.style.animation = 'fastlinkToastSlideOut 0.3s ease-out forwards';
+            setTimeout(() => {
+                if (toast.parentNode) {
+                    toast.parentNode.removeChild(toast);
+                }
+            }, 300);
+        }, duration);
+    }
+    
+    function showFastLinkProgress(title, percent, desc) {
+        let modal = document.getElementById('fastlink-progress-modal');
+        const taskQueueHtml = taskList.length > 0 ? ` - 队列 ${taskList.length}` : '';
+        
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'fastlink-progress-modal';
+            modal.className = 'fastlink-modal-overlay';
+            modal.innerHTML = `
+                <div class="fastlink-modal" style="position:relative;">
+                    <button id="minimize-progress-btn" style="position:absolute;right:12px;top:12px;width:32px;height:32px;border-radius:50%;background:#ffc504;color:#000;border:none;display:flex;align-items:center;justify-content:center;font-weight:700;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.15);z-index:10003;transition:all 0.2s ease;" title="最小化">−</button>
+                    <h3 id="fastlink-title">${title}${taskQueueHtml}</h3>
+                    <div class="fastlink-progress-bar">
+                        <div id="fastlink-progress" style="width: ${percent}%"></div>
+                    </div>
+                    <div id="fastlink-percent">${percent}%</div>
+                    <div id="fastlink-desc">${desc}</div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+            
+            // 绑定最小化按钮
+            const minimizeBtn = modal.querySelector('#minimize-progress-btn');
+            if (minimizeBtn && !minimizeBtn.dataset.bound) {
+                minimizeBtn.dataset.bound = 'true';
+                minimizeBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    isProgressMinimized = true;
+                    modal.remove();
+                    updateMinimizedWidget(title, percent, desc);
+                });
+            }
+        } else {
+            modal.querySelector('#fastlink-title').textContent = title + taskQueueHtml;
+            modal.querySelector('#fastlink-progress').style.width = percent + '%';
+            modal.querySelector('#fastlink-percent').textContent = percent + '%';
+            modal.querySelector('#fastlink-desc').textContent = desc;
+        }
+    }
+
+    function hideFastLinkProgress() {
+        const modal = document.getElementById('fastlink-progress-modal');
+        if (modal) modal.remove();
+        const widget = document.getElementById(minimizeWidgetId);
+        if (widget) widget.remove();
+        isProgressMinimized = false;
+    }
+
+    function showFastLinkCopyModal(shareLink) {
+        const fileListHtml = shareLinkManager.fileInfoList.length > 0 ? `
+            <div style="max-height:120px;overflow-y:auto;background:rgba(248,249,250,0.7);border-radius:8px;padding:10px;margin-bottom:16px;font-size:13px;">
+                <div style='color:#888;margin-bottom:6px;'>文件列表（共${shareLinkManager.fileInfoList.length}个）:</div>
+                ${shareLinkManager.fileInfoList.map(f => `<div style='color:#333;word-break:break-all;margin:2px 0;'>${f.path}</div>`).join('')}
+            </div>
+        ` : '';
+
+        const modal = document.createElement('div');
+        modal.className = 'fastlink-modal-overlay';
+        modal.id = 'fastlink-copy-modal';
+        modal.innerHTML = `
+            <div class="fastlink-modal">
+                <button class="close-btn" id="close-copy-modal">×</button>
+                <h3>🚀 秒传链接</h3>
+                ${fileListHtml}
+                <textarea id="fastlink-copy-text" placeholder="秒传链接已生成...">${shareLink}</textarea>
+                <div style="display: flex; gap: 12px; justify-content: center;">
+                    <div class="copy-dropdown" style="position: relative;">
+                        <button class="copy-btn" id="copy-main-btn">复制 ▼</button>
+                        <div class="copy-dropdown-menu" style="display: none; position: absolute; bottom: 100%; left: 0; background: #fff; border: 1px solid #e1e5e9; border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); min-width: 120px; z-index: 10001; margin-bottom: 6px; padding: 0;">
+                            <div class="copy-dropdown-item" data-type="text">复制纯文本</div>
+                            <div class="copy-dropdown-item" data-type="json">复制JSON</div>
+                        </div>
+                    </div>
+                    <button class="export-btn" id="export-json-btn">导出JSON</button>
+                    <button class="export-btn" id="close-modal-btn">关闭</button>
+                </div>
+            </div>
+        `;
+        
+        // 事件绑定
+        modal.querySelector('#close-copy-modal').addEventListener('click', () => modal.remove());
+        modal.querySelector('#close-modal-btn').addEventListener('click', () => modal.remove());
+        
+        // 复制按钮和下拉菜单
+        const dropdown = modal.querySelector('.copy-dropdown');
+        const dropdownMenu = modal.querySelector('.copy-dropdown-menu');
+        const mainBtn = modal.querySelector('#copy-main-btn');
+        
+        mainBtn.addEventListener('click', () => copyContent('text'));
+        bindTapDropdown(mainBtn, dropdown, dropdownMenu);
+        
+        modal.querySelectorAll('.copy-dropdown-item').forEach(item => {
+            item.addEventListener('click', () => {
+                copyContent(item.dataset.type);
+                dropdownMenu.style.display = 'none';
+            });
+        });
+        
+        // 导出JSON
+        modal.querySelector('#export-json-btn').addEventListener('click', () => exportJson());
+        
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+        document.body.appendChild(modal);
+        
+        function copyContent(type) {
+            const inputField = document.querySelector('#fastlink-copy-text');
+            if (!inputField) return;
+            
+            let contentToCopy = inputField.value;
+            
+            if (type === 'json') {
+                try {
+                    const jsonData = shareLinkManager.shareLinkToJson(contentToCopy);
+                    contentToCopy = JSON.stringify(jsonData, null, 2);
+                } catch (error) {
+                    showFastLinkToast('转换JSON失败: ' + error.message, 'error');
+                    return;
+                }
+            }
+            
+            navigator.clipboard.writeText(contentToCopy).then(() => {
+                showFastLinkToast(`已成功复制${type === 'json' ? 'JSON' : '纯文本'}到剪贴板 📋`, 'success');
+            }).catch(err => {
+                showFastLinkToast(`复制失败: ${err.message || '请手动复制内容'}`, 'error');
+            });
+        }
+        
+        function exportJson() {
+            const inputField = document.querySelector('#fastlink-copy-text');
+            if (!inputField) return;
+            
+            const shareLink = inputField.value;
+            if (!shareLink.trim()) {
+                showFastLinkToast('没有内容可导出', 'warning');
+                return;
+            }
+            
+            try {
+                const jsonData = shareLinkManager.shareLinkToJson(shareLink);
+                const jsonContent = JSON.stringify(jsonData, null, 2);
+                const filename = getExportFilename(shareLink);
+                
+                downloadJsonFile(jsonContent, filename);
+                showFastLinkToast('JSON文件导出成功 📁', 'success');
+            } catch (error) {
+                showFastLinkToast('导出失败: ' + error.message, 'error');
+            }
+        }
+        
+        function downloadJsonFile(content, filename) {
+            const blob = new Blob([content], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+        
+        function getExportFilename(shareLink) {
+            if (shareLinkManager.commonPath) {
+                const commonPath = shareLinkManager.commonPath.replace(/\/$/, '');
+                return `${commonPath}.json`;
+            }
+            return '秒传链接.json';
+        }
+    }
+
+    function showFastLinkInputModal() {
+        const modal = document.createElement('div');
+        modal.className = 'fastlink-modal-overlay';
+        modal.id = 'fastlink-input-modal';
+        modal.innerHTML = `
+            <div class="fastlink-modal">
+                <button class="close-btn" id="close-input-modal">×</button>
+                <h3>📥 保存秒传文件</h3>
+                <textarea id="fastlink-input-text" placeholder="请输入或粘贴秒传链接，或拖入JSON文件..."></textarea>
+                <div style="display: flex; gap: 12px; justify-content: center;">
+                    <button class="copy-btn" id="fastlink-save-btn">保存</button>
+                    <button class="file-input-btn" id="select-file-btn">选择JSON</button>
+                    <input type="file" id="json-file-input" accept=".json" style="display: none;">
+                    <button class="export-btn" id="cancel-input-btn">取消</button>
+                </div>
+            </div>
+        `;
+        
+        const textarea = modal.querySelector('#fastlink-input-text');
+        const fileInput = modal.querySelector('#json-file-input');
+        const selectFileBtn = modal.querySelector('#select-file-btn');
+        
+        // 文件拖拽功能
+        textarea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            textarea.style.borderColor = '#4CAF50';
+            textarea.style.background = '#f0f8f0';
+        });
+        
+        textarea.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            textarea.style.borderColor = '';
+            textarea.style.background = '';
+        });
+        
+        textarea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            textarea.style.borderColor = '';
+            textarea.style.background = '';
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                readJsonFile(files[0], textarea);
+            }
+        });
+        
+        // 文件选择功能
+        selectFileBtn.addEventListener('click', () => {
+            fileInput.click();
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            const files = e.target.files;
+            if (files.length > 0) {
+                readJsonFile(files[0], textarea);
+            }
+        });
+        
+        // 保存按钮
+        modal.querySelector('#fastlink-save-btn').addEventListener('click', async () => {
+            const content = textarea.value;
+            if (!content.trim()) {
+                showFastLinkToast("请输入秒传链接或导入JSON文件", 'warning');
+                return;
+            }
+            modal.remove();
+            await addAndRunTask('save', { content });
+        });
+        
+        // 关闭按钮
+        modal.querySelector('#close-input-modal').addEventListener('click', () => modal.remove());
+        modal.querySelector('#cancel-input-btn').addEventListener('click', () => modal.remove());
+        
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+        document.body.appendChild(modal);
+        
+        setTimeout(() => {
+            if (textarea) textarea.focus();
+        }, 100);
+        
+        function readJsonFile(file, textarea) {
+            if (!file.name.toLowerCase().endsWith('.json')) {
+                showFastLinkToast('请选择JSON文件', 'warning');
+                return;
+            }
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const jsonContent = e.target.result;
+                    const jsonData = JSON.parse(jsonContent);
+                    
+                    if (shareLinkManager.validateJson(jsonData)) {
+                        textarea.value = jsonContent;
+                        showFastLinkToast('JSON文件导入成功 ✅', 'success');
+                    } else {
+                        showFastLinkToast('无效的JSON格式', 'error');
+                    }
+                } catch (error) {
+                    showFastLinkToast('JSON文件解析失败: ' + error.message, 'error');
+                }
+            };
+            reader.readAsText(file);
+        }
+    }
+
+    function showFastLinkResult(result) {
+        const totalCount = result.success.length + result.failed.length;
+        const successCount = result.success.length;
+        const failedCount = result.failed.length;
+        
+        const failedListHtml = failedCount > 0 ? `
+            <div style="margin-top: 12px; color: #f44336; font-size: 14px;">
+                <div style="margin-bottom: 6px;">失败文件列表：</div>
+                <div style="max-height: 160px; overflow-y: auto; background: rgba(245,245,245,0.7); border-radius: 6px; padding: 8px;">
+                    ${result.failed.map(fileInfo => `<div style="font-size: 13px; margin: 2px 0;">${fileInfo.fileName} ${fileInfo.error ? `<span style="color: #f44336;">(${fileInfo.error})</span>` : ''}</div>`).join('')}
+                </div>
+            </div>
+        ` : '';
+
+        const modal = document.createElement('div');
+        modal.className = 'fastlink-modal-overlay';
+        modal.id = 'fastlink-result-modal';
+        modal.innerHTML = `
+            <div class="fastlink-modal">
+                <button class="close-btn" id="close-result-modal">×</button>
+                <h3>📊 保存结果</h3>
+                <div style="margin: 20px 0;">
+                    <div style="font-size: 16px; margin-bottom: 12px;">
+                        <span style="color: #666;">总计：</span><strong>${totalCount}</strong> 个文件
+                    </div>
+                    <div style="font-size: 16px; margin-bottom: 8px; color: #4CAF50;">
+                        ✅ 成功：<strong>${successCount}</strong> 个
+                    </div>
+                    <div style="font-size: 16px; margin-bottom: 8px; color: ${failedCount > 0 ? '#f44336' : '#666'};">
+                        ${failedCount > 0 ? '❌' : '✅'} 失败：<strong>${failedCount}</strong> 个
+                    </div>
+                    ${failedListHtml}
+                </div>
+                <div style="display: flex; gap: 12px; justify-content: center;">
+                    <button class="copy-btn" id="confirm-result-btn">确定</button>
+                    ${failedCount > 0 ? `
+                        <div class="copy-dropdown" style="position: relative;">
+                            <button class="file-input-btn" id="retry-btn">重试失败 ▼</button>
+                            <div class="copy-dropdown-menu" style="display: none; position: absolute; bottom: 100%; left: 0; background: #fff; border: 1px solid #e1e5e9; border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); min-width: 120px; z-index: 10001; margin-bottom: 6px; padding: 0;">
+                                <div class="copy-dropdown-item" data-action="retry">重试失败</div>
+                                <div class="copy-dropdown-item" data-action="export">导出失败链接</div>
+                            </div>
+                        </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+        
+        // 事件绑定
+        modal.querySelector('#close-result-modal').addEventListener('click', () => modal.remove());
+        modal.querySelector('#confirm-result-btn').addEventListener('click', () => modal.remove());
+        
+        // 重试按钮和下拉菜单
+        if (failedCount > 0) {
+            const dropdown = modal.querySelector('.copy-dropdown');
+            const dropdownMenu = modal.querySelector('.copy-dropdown-menu');
+            const retryBtn = modal.querySelector('#retry-btn');
+            
+            retryBtn.addEventListener('click', () => {
+                modal.remove();
+                addAndRunTask('retry', { fileList: result.failed });
+            });
+            
+            bindTapDropdown(retryBtn, dropdown, dropdownMenu);
+            
+            modal.querySelectorAll('.copy-dropdown-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    const action = item.dataset.action;
+                    if (action === 'retry') {
+                        modal.remove();
+                        addAndRunTask('retry', { fileList: result.failed });
+                    } else if (action === 'export') {
+                        const shareLink = shareLinkManager.buildShareLink(result.failed, result.commonPath || '');
+                        modal.remove();
+                        showFastLinkCopyModal(shareLink);
+                    }
+                    dropdownMenu.style.display = 'none';
+                });
+            });
+        }
+        
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+        document.body.appendChild(modal);
+    }
+
+    async function executeGenerateShareLink() {
+        if (!shareLinkManager) {
+            console.error('[123云盘解锁] shareLinkManager未初始化');
+            alert('秒传功能未启用');
+            return;
+        }
+        
+        if (!tableRowSelector) {
+            console.error('[123云盘解锁] tableRowSelector未初始化');
+            alert('文件选择器未初始化');
+            return;
+        }
+        
+        const fileSelection = tableRowSelector.getSelection();
+        
+        if (!fileSelection.isSelectAll && fileSelection.selectedRowKeys.length === 0) {
+            showFastLinkToast('请先选择文件', 'warning');
+            return;
+        }
+
+        shareLinkManager.progress = 0;
+        const poll = setInterval(() => {
+            updateFastLinkProgress("生成秒传链接", shareLinkManager.progress, shareLinkManager.progressDesc);
+            if (shareLinkManager.progress >= 100) {
+                clearInterval(poll);
+            }
+        }, 500);
+
+        const shareLink = await shareLinkManager.generateShareLink(fileSelection);
+        shareLinkManager.taskCancel = false;
+        clearInterval(poll);
+        hideFastLinkProgress();
+        
+        if (!shareLink) {
+            showFastLinkToast("没有选择文件", 'warning');
+            return;
+        }
+        showFastLinkCopyModal(shareLink);
+    }
+
+    async function executeSaveShareLink(content, retry = false) {
+        if (!shareLinkManager) {
+            alert('秒传功能未启用');
+            return;
+        }
+
+        shareLinkManager.progress = 0;
+        const poll = setInterval(() => {
+            updateFastLinkProgress("保存秒传文件", shareLinkManager.progress, shareLinkManager.progressDesc);
+            if (shareLinkManager.progress >= 100) {
+                clearInterval(poll);
+            }
+        }, 100);
+
+        let result;
+        if (retry) {
+            result = await shareLinkManager.retrySaveFailed(content);
+        } else {
+            result = await shareLinkManager.saveShareLink(content);
+        }
+        
+        shareLinkManager.taskCancel = false;
+        clearInterval(poll);
+        hideFastLinkProgress();
+        showFastLinkResult(result);
+        
+        // 刷新文件列表
+        try {
+            const renewButton = document.querySelector('.layout-operate-icon.mfy-tooltip svg');
+            if (renewButton) {
+                renewButton.click();
+            }
+        } catch(e) {}
+    }
+
+    // 任务队列系统
+    function addAndRunTask(taskType, params = {}) {
+        const taskId = ++taskIdCounter;
+        
+        if (taskType === 'generate') {
+            const fileSelectInfo = tableRowSelector.getSelection();
+            if (!fileSelectInfo || (!fileSelectInfo.isSelectAll && fileSelectInfo.selectedRowKeys.length === 0)) {
+                showFastLinkToast("请先选择文件", 'warning');
+                return;
+            }
+            taskList.push({ id: taskId, type: 'generate', params: { fileSelectInfo } });
+        } else if (taskType === 'save') {
+            taskList.push({ id: taskId, type: 'save', params: { content: params.content } });
+        } else if (taskType === 'retry') {
+            taskList.push({ id: taskId, type: 'retry', params: { fileList: params.fileList } });
+        }
+        
+        runNextTask();
+    }
+
+    function runNextTask() {
+        if (isTaskRunning) {
+            return;
+        }
+        
+        if (taskList.length === 0) {
+            return;
+        }
+
+        const task = taskList[0];
+        currentTask = task;
+        isTaskRunning = true;
+        
+        setTimeout(async () => {
+            try {
+                if (task.type === 'generate') {
+                    await executeGenerateShareLink();
+                } else if (task.type === 'save') {
+                    await executeSaveShareLink(task.params.content);
+                } else if (task.type === 'retry') {
+                    await executeSaveShareLink(task.params.fileList, true);
+                }
+            } catch (error) {
+                console.error('[123云盘解锁] 任务执行失败:', error);
+                showFastLinkToast('任务执行失败: ' + error.message, 'error');
+            }
+            
+            isTaskRunning = false;
+            taskList = taskList.filter(t => t.id !== task.id);
+            currentTask = null;
+            
+            runNextTask();
+        }, 100);
+    }
+
+    function cancelCurrentTask() {
+        if (shareLinkManager) {
+            shareLinkManager.taskCancel = true;
+        }
+        return true;
+    }
+
+    function updateFastLinkProgress(title, percent, desc) {
+        if (isProgressMinimized) {
+            updateMinimizedWidget(title, percent, desc);
+        } else {
+            showFastLinkProgress(title, percent, desc);
+        }
+    }
+
+    function updateMinimizedWidget(title, percent, desc) {
+        let widget = document.getElementById(minimizeWidgetId);
+        const taskCountHtml = taskList.length > 0 ? 
+            `<div style="position:absolute;left:-8px;top:-8px;width:22px;height:22px;background:#f44336;color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;z-index:2;box-shadow:0 2px 6px rgba(0,0,0,0.12);">${taskList.length}</div>` : '';
+        
+        const html = `
+            ${taskCountHtml}
+            <div style="flex:1;">
+                <div style="font-size:12px;color:#333;margin-bottom:6px;">${title}${taskList.length > 0 ? ` - 队列 ${taskList.length}` : ''}</div>
+                <div style="height:8px;background:#eee;border-radius:6px;overflow:hidden;">
+                    <div style="height:100%;background:#4CAF50;width:${percent}%;transition:width 0.2s;"></div>
+                </div>
+            </div>
+            <div style="font-size:12px;color:#666;width:36px;text-align:right;">${Math.ceil(percent)}%</div>
+        `;
+        
+        if (!widget) {
+            widget = document.createElement('div');
+            widget.id = minimizeWidgetId;
+            widget.style = 'position:fixed;right:20px;bottom:20px;width:220px;background:#fff;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,0.18);padding:10px 12px;z-index:10005;display:flex;align-items:center;gap:10px;cursor:pointer;';
+            widget.innerHTML = html;
+            widget.addEventListener('click', () => {
+                isProgressMinimized = false;
+                widget.remove();
+                updateFastLinkProgress(title, percent, desc);
+            });
+            document.body.appendChild(widget);
+        } else {
+            widget.innerHTML = html;
+        }
+    }
+
+    // ============ 分享页：选中单个文件 → 「提取该文件直链」 ============
+    const DIRECTLINK_TRIGGER_ID = 'directlink-trigger';
+
+    /** 分享页判定：mshare/share 子域，或路径里带 /123pan/ 或 /s/ */
+    function isSharePage() {
+        const h = String(location.hostname || '');
+        if (/(^|\.)(m?share)\.123pan\.(cn|com)$/.test(h)) return true;
+        return /\/123pan\//.test(location.pathname) || /^\/s\//.test(location.pathname);
+    }
+
+    /** 一行是不是被勾上：桌面版 rowSelected / 移动版 appTableSelected，兜底看复选框 */
+    function isShareRowSelected(row) {
+        const c = String(row.className || '');
+        if (/rowSelected/.test(c) || /appTableSelected/.test(c)) return true;
+        const cb = row.querySelector('input[type="checkbox"]');
+        return !!(cb && cb.checked);
+    }
+
+    /**
+     * 行里的文件名。
+     * 桌面版：.table-file-name / [class*="table-list-file-name"]
+     * 移动版：.file-name-display —— 它有 aria-label，能拿到**未被省略号截断**的全名，
+     *         比 textContent 更可靠（截断过的名字没法拿去和 share/get 的 FileName 精确匹配）。
+     */
+    function shareRowName(row) {
+        const nm = row.querySelector('[class*="table-list-file-name"]')
+            || row.querySelector('.table-file-name')
+            || row.querySelector('.file-name-display')
+            || row.querySelector('.file-name-line');
+        if (!nm) return '';
+        let al = '';
+        try { al = String((nm.getAttribute && nm.getAttribute('aria-label')) || '').trim(); } catch (e) { }
+        return al || String(nm.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    /** 行里是不是文件夹：行内任意 img 的 src 含 folder 即是（两版布局通用） */
+    function shareRowIsFolder(row) {
+        const imgs = row.querySelectorAll('img');
+        for (let i = 0; i < imgs.length; i++) {
+            if (/folder/i.test(String(imgs[i].getAttribute('src') || ''))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 分享页当前**被勾选**的行 -> [{ name, isFolder }]。
+     * 站点有两套布局，同一份脚本都要认：
+     *   桌面版  <table> 行 = tr.custom-table-row
+     *   移动版  div 列表 行 = .appTable     <- M浏览器 / 手机浏览器实测走的是这套
+     * 表头/全选那一行的复选框不在行容器里，天然被排除。
+     */
+    function getShareSelection() {
+        let rows = Array.prototype.slice.call(document.querySelectorAll('tr.custom-table-row'));
+        if (!rows.length) rows = Array.prototype.slice.call(document.querySelectorAll('.appTable'));
+        const out = [];
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (!isShareRowSelected(row)) continue;
+            const name = shareRowName(row);
+            if (!name) continue;
+            out.push({ name: name, isFolder: shareRowIsFolder(row) });
+        }
+        return out;
+    }
+
+    /**
+     * 分享页的 SPA 进子目录**不改 URL**，拿不到当前目录 id（行节点上也没有 data-* 带 FileId）。
+     * 做法：从根目录开始按文件名逐级往下找，命中即返回条目与它所属目录 id。
+     * 有界：最多 40 次请求、5 层，避免在超大分享里失控。
+     */
+    async function findShareFileByName(shareKey, fileName, parentFileId, depth, budget) {
+        const pid = (parentFileId == null ? 0 : parentFileId);
+        budget.n = (budget.n || 0) + 1;
+        // v1.3.4：预算 40→150、层级 5→10。大分享（固件包常有极深目录）需要更多次请求；
+        // 同时把"整棵树只找一次"的次数限制放开，避免树还没走完就被截断。
+        if (budget.n > 150 || depth > 10) return null;
+        const listed = await listShareFiles(shareKey, pid);
+        // v1.3.4：原来要求 code===0 才继续，新接口 code 字段可能不是 0（或缺失），
+        // Number(undefined)=NaN !== 0 会直接 return null，一次递归都不做。
+        // 改为：只要拿到了非空清单就继续处理。
+        const list = listed.list || [];
+        if (!list.length && Number(listed.code) !== 0 && Number(listed.code) !== -1) return null;
+        // 精确匹配
+        for (let i = 0; i < list.length; i++) {
+            if (String(list[i].FileName) === fileName && Number(list[i].Type) !== 1) {
+                return { item: list[i], parentId: pid };
+            }
+        }
+        // 容错匹配：去空白/大小写不敏感，避免页面显示名与接口返回名有细微差异
+        const normName = String(fileName).replace(/\s+/g, '').toLowerCase();
+        for (let i = 0; i < list.length; i++) {
+            const n = String(list[i].FileName || '').replace(/\s+/g, '').toLowerCase();
+            if (n && n === normName && Number(list[i].Type) !== 1) {
+                return { item: list[i], parentId: pid };
+            }
+        }
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1) continue;
+            // v1.3.4：目录间加 120ms 间隔，降低被服务端限流的概率（原实现连续打，易触发限流）
+            await new Promise(r => setTimeout(r, 120));
+            const hit = await findShareFileByName(shareKey, fileName, list[i].FileId, depth + 1, budget);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    /** 点按钮：把「选中行」翻成「该文件的直链」，复用 extractDirectLink 的整条链路 */
+    async function extractSelectedFileLink() {
+        const shareKey = currentShareKey();
+        if (!shareKey || !isSharePage()) return extractDirectLink({});
+        const selAll = getShareSelection();
+        // v1.3.6：允许勾选多个文件（打包）；文件夹一律排除（直链/打包都不支持）
+        const sel = selAll.filter(x => !x.isFolder);
+        if (!sel.length) {
+            showFastLinkToast(selAll.length
+                ? '选中的全是文件夹；请勾选文件（可多选，多文件会打包成 zip）'
+                : '请先勾选文件（可多选，多文件会打包成 zip）', 'warning', 4000);
+            return { ok: false, code: -1, reason: '未选中文件' };
+        }
+        const item = sel[0];
+        showFastLinkToast(sel.length === 1
+            ? '正在定位「' + item.name + '」…'
+            : '正在定位 ' + sel.length + ' 个文件…', 'info', 2500);
+
+        /* v1.3.6：多选时把每个文件都解析成完整条目（FileId/Size/Etag/S3KeyFlag），
+         * 优先从钩子捕获的当前层清单里按名字匹配，匹配不到再逐级查找。
+         */
+        if (sel.length > 1) {
+            const items = [];
+            let pid = 0;
+            try {
+                pid = (__hook && __hook.parentFileId != null && __hook.parentFileId !== '')
+                    ? Number(__hook.parentFileId) || 0 : 0;
+            } catch (e) { }
+            const src = (__hook && Array.isArray(__hook.list)) ? __hook.list : [];
+            for (const one of sel) {
+                let found = null;
+                const normT = String(one.name).replace(/\s+/g, '').toLowerCase();
+                for (let hi = 0; hi < src.length; hi++) {
+                    const n = String((src[hi].FileName || src[hi].fileName || src[hi].name) || '')
+                        .replace(/\s+/g, '').toLowerCase();
+                    if (n && n === normT) { found = normalizeShareItem(src[hi]); break; }
+                }
+                if (!found) {
+                    const b2 = { n: 0 };
+                    const h2 = await findShareFileByName(shareKey, one.name, pid, 0, b2);
+                    if (h2) found = h2.item;
+                }
+                if (found) items.push(found);
+            }
+            if (!items.length) {
+                showFastLinkToast('未能定位所选文件，请进入它们所在目录后重试', 'error', 5000);
+                return { ok: false, code: -1, reason: '未定位到所选文件' };
+            }
+            pan123State.shareKey = shareKey;
+            showFastLinkToast('已定位 ' + items.length + ' 个文件，正在打包…', 'info', 3000);
+            return extractDirectLink({ fileItems: items, pack: true, parentFileId: pid, noOpen: false });
+        }
+
+        // v1.3.5：先看页面自己刚列过的那一层里有没有这个文件。
+        // 页面进子目录不发 URL 变化，但它自己发的列表请求里带着真实 ParentFileId，
+        // 已被上面的钩子录下来。命中就直接用，完全免掉从根目录的盲递归。
+        var hit = null;
+        try {
+            var normTarget = String(item.name).replace(/\s+/g, '').toLowerCase();
+            var src = __hook.list || [];
+            for (var hi = 0; hi < src.length; hi++) {
+                var n = String((src[hi].FileName || src[hi].fileName || src[hi].name) || '')
+                    .replace(/\s+/g, '').toLowerCase();
+                if (n && n === normTarget) {
+                    var pidHook = (__hook.parentFileId != null && __hook.parentFileId !== '')
+                        ? __hook.parentFileId : 0;
+                    hit = { item: normalizeShareItem(src[hi]), parentId: pidHook };
+                    showFastLinkToast('已在当前目录命中「' + item.name + '」', 'info', 2500);
+                    break;
+                }
+            }
+        } catch (e) { }
+
+        // 钩子没命中，才退回从根目录逐级查找
+        if (!hit) {
+            var __startPid = 0;
+            try {
+                if (__hook.parentFileId != null && __hook.parentFileId !== '') {
+                    __startPid = Number(__hook.parentFileId) || 0;
+                }
+            } catch (e) { }
+            const __budget = { n: 0 };
+            hit = await findShareFileByName(shareKey, item.name, __startPid, 0, __budget);
+        }
+        if (!hit) {
+            const reason = '逐级查找没定位到「' + item.name + '」'
+                + '（已探索 ' + (budget.n || 0) + ' 个目录' 
+                + (pan123State.lastListVia ? '，末次路径 ' + pan123State.lastListVia : '')
+                + '）。可能是分享很大/目录很深，或列目录被服务端限流；'
+                + '建议进入该文件所在目录后重试（此时当前目录 id 可直接拿到）';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'error', 6000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        pan123State.shareKey = shareKey;
+        return extractDirectLink({ parentFileId: hit.parentId, onlyName: item.name });
+    }
+
+    /** 分享页浮动按钮：只在「恰好选中 1 个文件」时出现 */
+    /** 「提取该文件直链」点击处理：行内按钮与浮动圆钮共用同一套逻辑 */
+    function onDirectLinkClick(e) {
+        if (e && e.preventDefault) e.preventDefault();
+        if (e && e.stopPropagation) e.stopPropagation();
+        let dlOn = true;
+        try { dlOn = (typeof user === 'undefined') ? true : (user.directLink === 1); } catch (err) { dlOn = true; }
+        if (!dlOn) {
+            showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+            return;
+        }
+        extractSelectedFileLink().catch(function (err) {
+            showFastLinkToast('提取失败：' + err, 'error', 5000);
+        });
+    }
+
+    /**
+     * 「提取该文件直链」按钮：只在「恰好选中 1 个文件」时出现。
+     * 桌面版放进表头 .rightInfo 的下载按钮那一组（和站点自己的
+     * 「浏览器下载 / 客户端下载」排在一起）；移动版没有这条表头，
+     * 退回右下角浮动圆钮。
+     */
+    function updateDirectLinkTrigger() {
+        if (!isSharePage() || !document.body) return;
+        const sel = getShareSelection();
+        // v1.3.6：选中 1 个或多个文件都显示按钮（多个→打包）
+        const show = (sel.length >= 1 && sel.some(x => !x.isFolder));
+        const floatBtn = document.getElementById(DIRECTLINK_TRIGGER_ID);
+        const inlineBtn = document.getElementById('directlink-inline');
+        const wrap = headerRow();
+        const right = wrap ? wrap.querySelector('.rightInfo') : null;
+
+        if (!show) {
+            if (floatBtn) floatBtn.remove();
+            if (inlineBtn) inlineBtn.remove();
+            return;
+        }
+
+        if (right) {
+            // 桌面版：行内按钮，插到「浏览器下载 / 客户端下载」那一组之后
+            if (floatBtn) floatBtn.remove();
+            let btn = inlineBtn;
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.id = 'directlink-inline';
+                btn.type = 'button';
+                btn.className = 'pan123-inline-btn primary';
+                btn.addEventListener('click', onDirectLinkClick);
+            }
+            const __fileSel = sel.filter(x => !x.isFolder);
+            btn.title = __fileSel.length > 1
+                ? '把选中的 ' + __fileSel.length + ' 个文件打包成 zip 并提取直链'
+                : '提取「' + __fileSel[0].name + '」的直链（原文件，不打包）';
+            btn.setAttribute('aria-label', btn.title);
+            btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg><span>'
+                + (__fileSel.length > 1 ? ('打包 ' + __fileSel.length + ' 项') : '提取直链') + '</span>';
+            if (!right.contains(btn)) {
+                const anchors = right.querySelectorAll('.client-download-btn');
+                const last = anchors[anchors.length - 1];
+                const after = last ? (last.closest('.mfy_h-tooltip-module__trigger__9Pxct') || last) : null;
+                if (after && after.parentNode === right && after.nextSibling) {
+                    right.insertBefore(btn, after.nextSibling);
+                } else {
+                    right.appendChild(btn);
+                }
+            }
+            return;
+        }
+
+        // 移动版：右下浮动圆钮
+        if (inlineBtn) inlineBtn.remove();
+        if (floatBtn && document.body.contains(floatBtn)) return;
+        const el = document.createElement('button');
+        el.id = DIRECTLINK_TRIGGER_ID;
+        el.title = '提取「' + sel[0].name + '」的直链';
+        el.setAttribute('aria-label', el.title);
+        el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg>';
+        el.addEventListener('click', onDirectLinkClick);
+        document.body.appendChild(el);
+    }
+
+    /** 选中态是 React 重渲染出来的、不冒泡 click；用 MutationObserver + 捕获期 click + 轮询三重兜底 */
+    function addDirectLinkTrigger() {
+        if (!isSharePage()) return;
+        const tick = function () { try { updateDirectLinkTrigger(); } catch (e) { } };
+        tick();
+        let pending = false;
+        const schedule = function () {
+            if (pending) return;
+            pending = true;
+            setTimeout(function () { pending = false; tick(); }, 120);
+        };
+        try {
+            const mo = new MutationObserver(schedule);
+            mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'checked'] });
+        } catch (e) { }
+        document.addEventListener('click', schedule, true);
+        setInterval(tick, 2000);
+    }
+
+    function addFastLinkButton() {
+        if (!FastLinkConfig.enabled) {
+            return;
+        }
+        
+        const checkAndAddButton = () => {
+            const existingButton = document.getElementById('fastlink-trigger');
+            if (existingButton && document.body.contains(existingButton)) {
+                return;
+            }
+            
+            const isFilePage = window.location.pathname === "/" && 
+                              !window.location.search.includes("sharekey=") && 
+                              !window.location.pathname.includes("/account");
+            if (!isFilePage) {
+                return;
+            }
+            
+            if (!document.body) {
+                return;
+            }
+
+            const trigger = document.createElement('button');
+            trigger.id = 'fastlink-trigger';
+            trigger.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 1024 1024" fill="currentColor">
+                    <path d="M395.765333 586.570667h-171.733333c-22.421333 0-37.888-22.442667-29.909333-43.381334L364.768 95.274667A32 32 0 0 1 394.666667 74.666667h287.957333c22.72 0 38.208 23.018667 29.632 44.064l-99.36 243.882666h187.050667c27.509333 0 42.186667 32.426667 24.042666 53.098667l-458.602666 522.56c-22.293333 25.408-63.626667 3.392-54.976-29.28l85.354666-322.421333z"/>
+                </svg>
+            `;
+            
+            trigger.addEventListener('click', (e) => {
+                toggleFastLinkMenu(e);
+            });
+            
+            document.body.appendChild(trigger);
+
+            // 添加下拉菜单
+            const menu = document.createElement('div');
+            menu.id = 'fastlink-menu';
+            menu.className = 'fastlink-menu';
+            menu.innerHTML = `
+                <div class="fastlink-menu-item" data-action="generate">生成秒传链接</div>
+                <div class="fastlink-menu-item" data-action="save">保存秒传文件</div>
+            `;
+            menu.querySelectorAll('.fastlink-menu-item').forEach(item => {
+                item.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const action = item.dataset.action;
+                    menu.style.display = 'none';
+                    if (action === 'generate') {
+                        addAndRunTask('generate');
+                    } else if (action === 'save') {
+                        showFastLinkInputModal();
+                    }
+                });
+            });
+            document.body.appendChild(menu);
+        };
+
+        // 立即尝试添加按钮
+        checkAndAddButton();
+        
+        // 定期检查按钮是否还在
+        setInterval(() => {
+            const btn = document.getElementById('fastlink-trigger');
+            const isFilePage = window.location.pathname === "/" && 
+                              !window.location.search.includes("sharekey=") && 
+                              !window.location.pathname.includes("/account");
+            if (isFilePage && (!btn || !document.body.contains(btn))) {
+                checkAndAddButton();
+            }
+        }, 3000);
+    }
+
+    function toggleFastLinkMenu(e) {
+        e.stopPropagation();
+        const menu = document.getElementById('fastlink-menu');
+        if (!menu) {
+            return;
+        }
+        
+        const trigger = document.getElementById('fastlink-trigger');
+        const rect = trigger.getBoundingClientRect();
+        
+        if (menu.style.display === 'block') {
+            menu.style.display = 'none';
+        } else {
+            menu.style.right = (window.innerWidth - rect.right) + 'px';
+            menu.style.bottom = (window.innerHeight - rect.top + 5) + 'px';
+            menu.style.left = 'auto';
+            menu.style.display = 'block';
+        }
+    }
+
+    /** 分享页桌面版的表头操作栏：左 .leftInfo（头像/打赏）右 .rightInfo（下载类按钮） */
+    function headerRow() {
+        return document.querySelector('.content-header-container-wrap');
+    }
+
+    /**
+     * 桌面版：把「设置」放进头像那一行（.leftInfo，与上游的位置一致）。
+     * 放得下就返回 true，调用方不再创建右下浮动圆钮。
+     * 移动版没有这条表头，返回 false -> 仍旧用浮动圆钮。
+     */
+    function mountInlineSettings() {
+        const wrap = headerRow();
+        if (!wrap) return false;
+        const left = wrap.querySelector('.leftInfo');
+        if (!left) return false;
+        let btn = document.getElementById('settings-inline');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'settings-inline';
+            btn.className = 'pan123-inline-btn';
+            btn.type = 'button';
+            btn.title = '123云盘脚本设置';
+            btn.innerHTML = '<span>设置</span>';
+            btn.addEventListener('click', createSettingsPanel);
+        }
+        if (!left.contains(btn)) left.appendChild(btn);
+        const float = document.getElementById('settings-trigger');
+        if (float) float.remove();
+        return true;
+    }
+
+    function addTriggerButton() {
+        if (mountInlineSettings()) return;
+        const trigger = document.createElement('button');
+        trigger.id = 'settings-trigger';
+        trigger.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+        `;
+        trigger.addEventListener('click', createSettingsPanel);
+        document.body.appendChild(trigger);
+    }
+
+    // 添加样式 - 修复版本
+    function addStyles() {
+        // 先移除可能存在的旧样式
+        const existingStyle = document.getElementById('vip-settings-style');
+        if (existingStyle) {
+            existingStyle.remove();
+        }
+
+        const style = document.createElement('style');
+        style.id = 'vip-settings-style';
+        style.textContent = `
+            /* 全局样式 */
+            .settings-panel {
+                position: fixed !important;
+                top: 50% !important;
+                left: 50% !important;
+                transform: translate(-50%, -50%) !important;
+                background: rgba(255, 255, 255, 0.95) !important;
+                backdrop-filter: blur(20px) !important;
+                -webkit-backdrop-filter: blur(20px) !important;
+                border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                border-radius: 16px !important;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                z-index: 10000 !important;
+                width: 90% !important;
+                max-width: 500px !important;
+                max-height: 80vh !important;
+                overflow: hidden !important;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif !important;
+                color: #333 !important;
+                animation: panelFadeIn 0.3s ease !important;
+                -webkit-font-smoothing: antialiased !important;
+                -moz-osx-font-smoothing: grayscale !important;
+                text-rendering: optimizeLegibility !important;
+            }
+            
+            @keyframes panelFadeIn {
+                from { opacity: 0; transform: translate(-50%, -48%); }
+                to { opacity: 1; transform: translate(-50%, -50%); }
+            }
+            
+            .panel-header {
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+                padding: 16px 20px !important;
+                border-bottom: 1px solid rgba(238, 238, 238, 0.6) !important;
+                background: rgba(248, 249, 250, 0.8) !important;
+                backdrop-filter: blur(10px) !important;
+                -webkit-backdrop-filter: blur(10px) !important;
+                border-radius: 16px 16px 0 0 !important;
+            }
+            
+            .title-container {
+                display: flex !important;
+                align-items: center !important;
+                gap: 10px !important;
+                -webkit-font-smoothing: antialiased !important;
+                -moz-osx-font-smoothing: grayscale !important;
+            }
+            
+            .panel-header h3 {
+                margin: 0 !important;
+                font-size: 18px !important;
+                font-weight: 600 !important;
+                color: #1a73e8 !important;
+                text-rendering: optimizeLegibility !important;
+                -webkit-font-smoothing: antialiased !important;
+                -moz-osx-font-smoothing: grayscale !important;
+                letter-spacing: 0.01em !important;
+            }
+            
+            .github-icon {
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 30px !important;
+                height: 30px !important;
+                background: rgba(26, 115, 232, 0.1) !important;
+                border: 1px solid rgba(26, 115, 232, 0.2) !important;
+                border-radius: 6px !important;
+                color: #1a73e8 !important;
+                text-decoration: none !important;
+                transition: all 0.3s ease !important;
+                backdrop-filter: blur(5px) !important;
+                -webkit-backdrop-filter: blur(5px) !important;
+                image-rendering: -webkit-optimize-contrast !important;
+                image-rendering: crisp-edges !important;
+                shape-rendering: geometricPrecision !important;
+            }
+            
+            .github-icon:hover {
+                background: rgba(26, 115, 232, 0.15) !important;
+                border-color: rgba(26, 115, 232, 0.4) !important;
+                transform: scale(1.05) !important;
+                color: #1557b0 !important;
+            }
+            
+            .close-btn {
+                background: none !important;
+                border: none !important;
+                font-size: 24px !important;
+                cursor: pointer !important;
+                color: #70757a !important;
+                padding: 0 !important;
+                width: 30px !important;
+                height: 30px !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                border-radius: 50% !important;
+                transition: background 0.2s !important;
+            }
+            
+            .close-btn:hover {
+                background: #f1f3f4 !important;
+                color: #d93025 !important;
+            }
+            
+            .settings-list {
+                padding: 16px 20px !important;
+                overflow-y: auto !important;
+                max-height: calc(80vh - 180px) !important;
+                padding-bottom: 20px !important;
+            }
+            
+            .setting-item {
+                margin-bottom: 16px !important;
+                padding: 12px !important;
+                background: rgba(248, 249, 250, 0.7) !important;
+                backdrop-filter: blur(5px) !important;
+                -webkit-backdrop-filter: blur(5px) !important;
+                border-radius: 12px !important;
+                border: 1px solid rgba(232, 234, 237, 0.6) !important;
+                transition: all 0.3s ease !important;
+            }
+            
+            .setting-item:hover {
+                background: rgba(248, 249, 250, 0.9) !important;
+                border-color: rgba(26, 115, 232, 0.3) !important;
+                transform: translateY(-1px) !important;
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08) !important;
+            }
+            
+            .setting-content {
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+                margin-bottom: 8px !important;
+            }
+            
+            .setting-key {
+                font-weight: 500 !important;
+                flex: 1 !important;
+            }
+            
+            .setting-value {
+                color: #1a73e8 !important;
+                font-weight: 500 !important;
+                text-align: right !important;
+            }
+            
+            .setting-comment {
+                font-size: 12px !important;
+                color: #70757a !important;
+                line-height: 1.4 !important;
+            }
+            
+            /* 开关样式 */
+            .switch {
+                position: relative !important;
+                display: inline-block !important;
+                width: 40px !important;
+                height: 20px !important;
+            }
+            
+            .switch input {
+                opacity: 0 !important;
+                width: 0 !important;
+                height: 0 !important;
+            }
+            
+            .slider {
+                position: absolute !important;
+                cursor: pointer !important;
+                top: 0 !important;
+                left: 0 !important;
+                right: 0 !important;
+                bottom: 0 !important;
+                background-color: #ccc !important;
+                transition: .3s !important;
+            }
+            
+            .slider:before {
+                position: absolute !important;
+                content: "" !important;
+                height: 16px !important;
+                width: 16px !important;
+                left: 2px !important;
+                bottom: 2px !important;
+                background-color: white !important;
+                transition: .3s !important;
+            }
+            
+            input:checked + .slider {
+                background-color: #1a73e8 !important;
+            }
+            
+            input:checked + .slider:before {
+                transform: translateX(20px) !important;
+            }
+            
+            .slider.round {
+                border-radius: 34px !important;
+            }
+            
+            .slider.round:before {
+                border-radius: 50% !important;
+            }
+            
+            /* 输入框和按钮样式 */
+            .input-container {
+                display: flex !important;
+                gap: 8px !important;
+            }
+            
+            .setting-input {
+                padding: 6px 10px !important;
+                border: 1px solid #dadce0 !important;
+                border-radius: 4px !important;
+                font-size: 14px !important;
+                flex: 1 !important;
+                min-width: 0 !important;
+            }
+            
+            .setting-input:focus {
+                outline: none !important;
+                border-color: #1a73e8 !important;
+            }
+            
+            .save-btn {
+                padding: 6px 12px !important;
+                background: #1a73e8 !important;
+                color: white !important;
+                border: none !important;
+                border-radius: 4px !important;
+                cursor: pointer !important;
+                font-size: 12px !important;
+                transition: background 0.2s !important;
+                white-space: nowrap !important;
+            }
+            
+            .save-btn:hover {
+                background: #1557b0 !important;
+            }
+            
+            .save-btn.saved {
+                background: #188038 !important;
+            }
+            
+            /* 交流群按钮 */
+            .group-btn {
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                gap: 8px !important;
+                position: sticky !important;
+                bottom: 0 !important;
+                margin: 8px 20px 20px 20px !important;
+                padding: 12px 16px !important;
+                background: linear-gradient(135deg, rgba(26, 115, 232, 0.9), rgba(21, 87, 176, 0.9)) !important;
+                backdrop-filter: blur(15px) !important;
+                -webkit-backdrop-filter: blur(15px) !important;
+                color: white !important;
+                border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                border-radius: 12px !important;
+                cursor: pointer !important;
+                text-decoration: none !important;
+                font-weight: 500 !important;
+                transition: all 0.3s ease !important;
+                box-shadow: 0 4px 12px rgba(26, 115, 232, 0.2), 0 -2px 10px rgba(0, 0, 0, 0.1) !important;
+                z-index: 10 !important;
+            }
+            
+            .group-btn:hover {
+                transform: translateY(-2px) !important;
+                box-shadow: 0 8px 20px rgba(26, 115, 232, 0.4), 0 -4px 15px rgba(0, 0, 0, 0.15) !important;
+                background: linear-gradient(135deg, rgba(26, 115, 232, 1), rgba(21, 87, 176, 1)) !important;
+            }
+            
+            /* 表头操作栏里的行内按钮（桌面版；移动版仍用右下浮动圆钮） */
+            .pan123-inline-btn {
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                gap: 6px !important;
+                height: 32px !important;
+                padding: 0 12px !important;
+                margin-left: 8px !important;
+                font-size: 14px !important;
+                font-family: inherit !important;
+                color: #1a73e8 !important;
+                background: rgba(26, 115, 232, 0.08) !important;
+                border: 1px solid rgba(26, 115, 232, 0.35) !important;
+                border-radius: 6px !important;
+                cursor: pointer !important;
+                white-space: nowrap !important;
+                vertical-align: middle !important;
+                transition: background 0.2s ease, color 0.2s ease !important;
+            }
+            .pan123-inline-btn:hover {
+                background: rgba(26, 115, 232, 0.16) !important;
+            }
+            .pan123-inline-btn.primary {
+                color: #fff !important;
+                background: #1a73e8 !important;
+                border-color: #1a73e8 !important;
+            }
+            .pan123-inline-btn.primary:hover {
+                background: #1557b0 !important;
+            }
+            .pan123-inline-btn svg { flex: 0 0 auto !important; }
+
+            /* 触发按钮 */
+            #settings-trigger {
+                position: fixed !important;
+                bottom: 20px !important;
+                right: 20px !important;
+                width: 54px !important;
+                height: 54px !important;
+                background: rgba(26, 115, 232, 0.9) !important;
+                backdrop-filter: blur(15px) !important;
+                -webkit-backdrop-filter: blur(15px) !important;
+                color: white !important;
+                border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                border-radius: 50% !important;
+                cursor: pointer !important;
+                z-index: 9999 !important;
+                box-shadow: 0 6px 20px rgba(26, 115, 232, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                transition: all 0.3s ease !important;
+            }
+            
+            #settings-trigger:hover {
+                background: rgba(21, 87, 176, 0.95) !important;
+                transform: scale(1.05) rotate(90deg) !important;
+                box-shadow: 0 8px 25px rgba(26, 115, 232, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
+            }
+            
+                /* 分享页：选中单个文件时的「提取该文件直链」按钮。
+                   ⚡ 只在主站出现、本按钮只在分享页出现，因此共用同一竖列位置。
+                   注意：基础样式必须写在下面的 @media 之前，否则窄屏媒体查询会被它盖掉，
+                   导致这枚按钮在手机上比其他两枚大一圈（实测 Via 上就是 54px vs 44px）。 */
+                #directlink-trigger {
+                    position: fixed !important;
+                    bottom: 90px !important;
+                    right: 20px !important;
+                    width: 54px !important;
+                    height: 54px !important;
+                    background: rgba(0, 137, 123, 0.92) !important;
+                    backdrop-filter: blur(15px) !important;
+                    -webkit-backdrop-filter: blur(15px) !important;
+                    color: white !important;
+                    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+                    border-radius: 50% !important;
+                    cursor: pointer !important;
+                    z-index: 9999 !important;
+                    box-shadow: 0 6px 20px rgba(0, 137, 123, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: transform 0.25s ease, background 0.25s ease, box-shadow 0.25s ease !important;
+                }
+                #directlink-trigger:hover,
+                #directlink-trigger:active {
+                    background: rgba(0, 121, 108, 0.98) !important;
+                    transform: scale(1.06) !important;
+                    box-shadow: 0 10px 26px rgba(0, 137, 123, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
+                }
+
+                /* 响应式设计 */
+                @media (max-width: 600px) {
+                    .settings-panel {
+                        width: 95% !important;
+                        max-height: 85vh !important;
+                    }
+                    
+                    .panel-header {
+                        padding: 14px 16px !important;
+                    }
+                    
+                    .settings-list {
+                        padding: 12px 16px !important;
+                        max-height: calc(85vh - 160px) !important;
+                        padding-bottom: 16px !important;
+                    }
+                    
+                    .setting-content {
+                        flex-direction: column !important;
+                        align-items: flex-start !important;
+                        gap: 8px !important;
+                    }
+                    
+                    .input-container {
+                        width: 100% !important;
+                    }
+                    
+                    .group-btn {
+                        margin: 8px 16px 16px 16px !important;
+                        padding: 10px 14px !important;
+                    }
+                    
+                    .title-container {
+                        gap: 8px !important;
+                    }
+                    
+                    .github-icon {
+                        width: 28px !important;
+                        height: 28px !important;
+                    }
+                    
+                    .github-icon svg {
+                        width: 18px !important;
+                        height: 18px !important;
+                    }
+                    
+                    #settings-trigger {
+                        bottom: 16px !important;
+                        right: 16px !important;
+                        width: 44px !important;
+                        height: 44px !important;
+                    }
+                    
+                    #fastlink-trigger {
+                        bottom: 70px !important;
+                        right: 16px !important;
+                        width: 44px !important;
+                        height: 44px !important;
+                    }
+
+                    #directlink-trigger {
+                        bottom: 70px !important;
+                        right: 16px !important;
+                        width: 44px !important;
+                        height: 44px !important;
+                    }
+                }
+                
+                /* 秒传功能样式 */
+                #fastlink-trigger {
+                    position: fixed !important;
+                    bottom: 90px !important;
+                    right: 20px !important;
+                    width: 54px !important;
+                    height: 54px !important;
+                    background: rgba(76, 175, 80, 0.9) !important;
+                    backdrop-filter: blur(15px) !important;
+                    -webkit-backdrop-filter: blur(15px) !important;
+                    color: white !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                    border-radius: 50% !important;
+                    cursor: pointer !important;
+                    z-index: 9999 !important;
+                    box-shadow: 0 6px 20px rgba(76, 175, 80, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: all 0.3s ease !important;
+                }
+                
+                #fastlink-trigger:hover {
+                    background: rgba(67, 160, 71, 0.95) !important;
+                    transform: scale(1.05) !important;
+                    box-shadow: 0 8px 25px rgba(76, 175, 80, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
+                }
+                
+                .fastlink-menu {
+                    position: fixed !important;
+                    display: none;
+                    background: rgba(255, 255, 255, 0.95) !important;
+                    backdrop-filter: blur(15px) !important;
+                    -webkit-backdrop-filter: blur(15px) !important;
+                    border: 1px solid rgba(0, 0, 0, 0.1) !important;
+                    border-radius: 10px !important;
+                    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15) !important;
+                    overflow: hidden !important;
+                    z-index: 10000 !important;
+                    min-width: 140px !important;
+                }
+                
+                .fastlink-menu-item {
+                    padding: 12px 16px !important;
+                    cursor: pointer !important;
+                    font-size: 14px !important;
+                    color: #333 !important;
+                    transition: all 0.2s !important;
+                    border-bottom: 1px solid rgba(0, 0, 0, 0.05) !important;
+                }
+                
+                .fastlink-menu-item:last-child {
+                    border-bottom: none !important;
+                }
+                
+                .copy-dropdown {
+                    position: relative;
+                    display: inline-block;
+                }
+                
+                .copy-dropdown-menu {
+                    position: absolute;
+                    background: #fff;
+                    border: 1px solid #e1e5e9;
+                    border-radius: 10px;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+                    min-width: 120px;
+                    z-index: 10001;
+                    padding: 0;
+                }
+                
+                .copy-dropdown:hover .copy-dropdown-menu {
+                    display: block !important;
+                }
+                
+                .copy-dropdown-item {
+                    padding: 10px 18px;
+                    cursor: pointer;
+                    font-size: 14px;
+                    border-bottom: 1px solid #f0f0f0;
+                    background: #fff;
+                    transition: background 0.2s;
+                }
+                
+                .copy-dropdown-item:first-child {
+                    border-radius: 10px 10px 0 0;
+                }
+                
+                .copy-dropdown-item:last-child {
+                    border-bottom: none;
+                    border-radius: 0 0 10px 10px;
+                }
+                
+                .copy-dropdown-item:hover {
+                    background: #e8f5e9;
+                    color: #388e3c;
+                }
+                
+                .copy-btn {
+                    background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+                    color: white;
+                    border: none;
+                    padding: 14px 24px;
+                    cursor: pointer;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 500;
+                    min-width: 100px;
+                    transition: all 0.3s ease;
+                    box-shadow: 0 4px 12px rgba(76, 175, 80, 0.3);
+                }
+                
+                .copy-btn:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 20px rgba(76, 175, 80, 0.4);
+                }
+                
+                .copy-btn:active {
+                    transform: translateY(0);
+                    box-shadow: 0 2px 8px rgba(76, 175, 80, 0.3);
+                }
+                
+                .export-btn {
+                    background: linear-gradient(135deg, #2196F3 0%, #1976D2 100%);
+                    color: white;
+                    border: none;
+                    padding: 14px 24px;
+                    cursor: pointer;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 500;
+                    min-width: 100px;
+                    transition: all 0.3s ease;
+                    box-shadow: 0 4px 12px rgba(33, 150, 243, 0.3);
+                }
+                
+                .export-btn:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 20px rgba(33, 150, 243, 0.4);
+                }
+                
+                .export-btn:active {
+                    transform: translateY(0);
+                    box-shadow: 0 2px 8px rgba(33, 150, 243, 0.3);
+                }
+                
+                .file-input-btn {
+                    background: linear-gradient(135deg, #FF9800 0%, #F57C00 100%);
+                    color: white;
+                    border: none;
+                    padding: 14px 24px;
+                    cursor: pointer;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 500;
+                    min-width: 100px;
+                    transition: all 0.3s ease;
+                    box-shadow: 0 4px 12px rgba(255, 152, 0, 0.3);
+                }
+                
+                .file-input-btn:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 20px rgba(255, 152, 0, 0.4);
+                }
+                
+                .file-input-btn:active {
+                    transform: translateY(0);
+                    box-shadow: 0 2px 8px rgba(255, 152, 0, 0.3);
+                }
+                
+                .close-btn {
+                    position: absolute;
+                    top: 16px;
+                    right: 16px;
+                    background: transparent;
+                    border: none;
+                    font-size: 24px;
+                    color: #999;
+                    cursor: pointer;
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    transition: all 0.2s ease;
+                }
+                
+                .close-btn:hover {
+                    background: rgba(244, 67, 54, 0.1);
+                    color: #f44336;
+                    transform: scale(1.1);
+                }
+                
+                .fastlink-menu-item:hover {
+                    background: rgba(76, 175, 80, 0.1) !important;
+                    color: #4CAF50 !important;
+                }
+                
+                @keyframes fastlinkToastSlideIn {
+                    from {
+                        transform: translateX(400px);
+                        opacity: 0;
+                    }
+                    to {
+                        transform: translateX(0);
+                        opacity: 1;
+                    }
+                }
+                
+                @keyframes fastlinkToastSlideOut {
+                    from {
+                        transform: translateX(0);
+                        opacity: 1;
+                    }
+                    to {
+                        transform: translateX(400px);
+                        opacity: 0;
+                    }
+                }
+                
+                .fastlink-modal-overlay {
+                    display: flex !important;
+                    position: fixed !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    background: rgba(0, 0, 0, 0.6) !important;
+                    backdrop-filter: blur(4px) !important;
+                    justify-content: center !important;
+                    align-items: center !important;
+                    z-index: 10000 !important;
+                    animation: fadeIn 0.3s ease-out !important;
+                }
+                
+                .fastlink-modal {
+                    background: rgba(255, 255, 255, 0.95) !important;
+                    backdrop-filter: blur(20px) !important;
+                    -webkit-backdrop-filter: blur(20px) !important;
+                    padding: 32px !important;
+                    border-radius: 16px !important;
+                    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15) !important;
+                    text-align: center !important;
+                    width: 480px !important;
+                    max-width: 90vw !important;
+                    max-height: 90vh !important;
+                    overflow: hidden !important;
+                    position: relative !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                }
+                
+                .fastlink-modal h3 {
+                    margin: 0 0 20px 0 !important;
+                    font-size: 20px !important;
+                    color: #333 !important;
+                }
+                
+                .fastlink-modal textarea {
+                    width: 100% !important;
+                    padding: 16px !important;
+                    margin: 0 0 24px 0 !important;
+                    border: 2px solid #e1e5e9 !important;
+                    border-radius: 12px !important;
+                    resize: vertical !important;
+                    min-height: 120px !important;
+                    font-family: 'Consolas', 'Monaco', 'Courier New', monospace !important;
+                    font-size: 14px !important;
+                    line-height: 1.5 !important;
+                    background: rgba(250, 251, 252, 0.7) !important;
+                    transition: all 0.3s ease !important;
+                    box-sizing: border-box !important;
+                    outline: none !important;
+                }
+                
+                .fastlink-modal textarea:focus {
+                    border-color: #4CAF50 !important;
+                    background: rgba(255, 255, 255, 0.9) !important;
+                    box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.1) !important;
+                }
+                
+                .fastlink-progress-bar {
+                    background: #eee !important;
+                    border-radius: 8px !important;
+                    overflow: hidden !important;
+                    height: 18px !important;
+                    margin: 20px 0 !important;
+                }
+                
+                #fastlink-progress {
+                    background: linear-gradient(90deg, #4CAF50, #66BB6A) !important;
+                    height: 100% !important;
+                    transition: width 0.3s !important;
+                }
+                
+                #fastlink-title {
+                    margin-bottom: 16px !important;
+                    font-size: 18px !important;
+                    color: #333 !important;
+                    word-wrap: break-word !important;
+                    word-break: break-all !important;
+                    white-space: pre-wrap !important;
+                    line-height: 1.4 !important;
+                }
+                
+                #fastlink-percent {
+                    margin: 8px 0 !important;
+                    font-size: 14px !important;
+                    color: #666 !important;
+                    font-weight: 500 !important;
+                }
+                
+                #fastlink-desc {
+                    margin-top: 8px !important;
+                    font-size: 13px !important;
+                    color: #888 !important;
+                    word-wrap: break-word !important;
+                    word-break: break-all !important;
+                    white-space: pre-wrap !important;
+                    line-height: 1.4 !important;
+                    min-height: 20px !important;
+                }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // 注册菜单命令
+    // 注册菜单命令
+    GM_registerMenuCommand('⚙️ 打开设置面板', createSettingsPanel);
+    GM_registerMenuCommand('⬇️ 提取当前分享直链', function () {
+        if (user.directLink !== 1) {
+            showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+            return;
+        }
+        extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+    });
+    GM_registerMenuCommand('🔎 下载状态诊断（登录态/流量闸门/直链）', function () {
+        diagnoseDownload().catch(function (e) { showFastLinkToast('诊断失败：' + e, 'error', 5000); });
+    });
+    GM_registerMenuCommand('🔑 打开登录入口（登录后每月 10GB 免费提取）', function () {
+        openLoginEntry();
+    });
+
+    // 调试/自测入口（供控制台与自动化验收调用）
+    try {
+        unsafeWindow.__pan123Fix = {
+            version: '1.3.6',
+            state: pan123State,
+            currentShareKey: currentShareKey,
+            buildDownloadUrlFromResponse: buildDownloadUrlFromResponse,
+            normalizeDownloadUrl: normalizeDownloadUrl,
+            extractDirectLink: extractDirectLink,
+            diagnoseDownload: diagnoseDownload,
+            detectLoginState: detectLoginState,
+            fetchTrafficCheck: fetchTrafficCheck,
+            listShareFiles: listShareFiles,
+            hook: __hook,
+            openLoginEntry: openLoginEntry,
+            rules: rules
+        };
+    } catch (e) { }
+
+    // 等待页面加载完成
+    function waitForBody() {
+        if (document.body) {
+            addStyles(); // 先添加样式
+            addTriggerButton(); // 添加设置按钮（桌面版放进头像那一行）
+            addDirectLinkTrigger(); // 分享页：选中单个文件时出现「提取该文件直链」
+            
+            // 初始化秒传功能
+            if (FastLinkConfig.enabled) {
+                initFastLink();
+                addFastLinkButton(); // 添加秒传按钮
+                
+                // 点击其他地方关闭菜单
+                document.addEventListener('click', (e) => {
+                    const menu = document.getElementById('fastlink-menu');
+                    const trigger = document.getElementById('fastlink-trigger');
+                    if (menu && trigger && !trigger.contains(e.target) && !menu.contains(e.target)) {
+                        menu.style.display = 'none';
+                    }
+                });
+                
+                console.log('[123云盘解锁] 秒传菜单关闭监听器已添加');
+            }
+        } else {
+            setTimeout(waitForBody, 100);
+        }
+    }
+
+    // 页面加载完成后初始化
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', waitForBody);
+    } else {
+        waitForBody();
+    }
+
+    // 输出版本信息
+    console.log('[123云盘解锁+秒传] v1.2.0 已加载完成');
+    if (FastLinkConfig.enabled) {
+        console.log('[123云盘解锁] 秒传功能已启用');
+    }
+})();
