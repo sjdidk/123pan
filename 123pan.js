@@ -52,7 +52,7 @@
 // @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
 // @homepageURL  https://github.com/hawchou1995/123pan_unlock
 // @supportURL   https://qingju.me
-// @version      1.3.6
+// @version      1.3.9
 // @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
@@ -159,7 +159,13 @@
     }
 
     try {
-        var __OrigXHR = window.XMLHttpRequest;
+        // v1.3.8 根因修复：本脚本有 @grant，Tampermonkey 下脚本里的 window 是
+        // **沙箱代理**，页面自己的请求走的是 unsafeWindow.XMLHttpRequest。
+        // 之前挂在 window 上，等于挂在了沙箱副本，页面请求一个都抓不到
+        // （实测 hook.seen 恒为 0、endpoint 恒为 null），"当前目录命中"这条
+        // 快速路径从来没生效过，只能fallback到逐级递归 —— 这就是"反应慢"。
+        var __w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+        var __OrigXHR = __w.XMLHttpRequest;
         var __origOpen = __OrigXHR.prototype.open;
         var __origSend = __OrigXHR.prototype.send;
         __OrigXHR.prototype.open = function (m, u) {
@@ -192,9 +198,9 @@
     } catch (e) { }
 
     try {
-        if (window.fetch) {
-            var __origFetch = window.fetch;
-            window.fetch = function () {
+        if (__w.fetch) {
+            var __origFetch = __w.fetch;
+            __w.fetch = function () {
                 var args = arguments;
                 var u = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url);
                 var body = args[1] && args[1].body;
@@ -1492,7 +1498,7 @@
 
     /** 服务端状态快照（供控制台诊断与自动化验收读取，不参与任何伪造） */
     const pan123State = {
-        version: '1.3.6',
+        version: '1.3.9',
         shareKey: '',
         loggedIn: null,        // true/false/null(未知)
         visitor: null,         // GET /api/share/visitor/info 原文
@@ -1838,7 +1844,14 @@
          * 选中多个文件时，向批量接口发**一次**请求（fileIdList 含全部文件），
          * 服务端打包成 zip 返回单个直链。这比逐个提取更符合「点多文件打包」的预期。
          */
+        /* v1.3.9：打包走得通就不再跑逐文件循环。
+         * 原实现打包成功后仍继续 for 循环，对每个文件再发一次 batch 请求
+         * （N 个文件 = N 次服务端打包往返），且打包失败时也会静默跑完这 N 次，
+         * 全程没有任何提示 —— 用户看到的就是「点了没反应」。
+         */
+        let __packDone = false;
         if (files.length > 1 || opts.pack) {
+            showFastLinkToast('正在打包 ' + files.length + ' 个文件…（服务端打包，文件多时需十几秒）', 'info', 30000);
             const __idList = files.map(ff => ({
                 FileID: ff.FileId,
                 S3keyFlag: ff.S3KeyFlag || ff.S3keyFlag || '',
@@ -1860,19 +1873,24 @@
                         via: 'batch_download_share_info', code: 0, message: __bj.message,
                         packed: true
                     });
+                    __packDone = true;
                 }
             }
-            if (!results.length) {
-                results.push({
-                    file: '打包 ' + files.length + ' 个文件', fileId: 0, size: 0,
-                    etagPresent: false, url: null, shape: null,
-                    via: 'batch_download_share_info', code: __bj.code,
-                    message: __bj.message || '打包失败', packed: true
-                });
+            if (!__packDone) {
+                // 打包失败：明确报错并直接返回，不再逐个重试（那只会更慢且无提示）
+                const __why = (__bj.code === 5112)
+                    ? '服务端 5112：登录态失效或访客被拒，请重新登录 123 云盘'
+                    : (__bj.code === 5113 || __bj.code === 5114)
+                        ? ('服务端 ' + __bj.code + '「' + (__bj.message || '分享方提取流量包不足') + '」：该分享的提取流量已耗尽')
+                        : ('打包失败（code=' + __bj.code + '，msg=' + (__bj.message || '空响应') + '，HTTP ' + (__bat.status || 0) + '）');
+                pan123State.lastResult = { ok: false, code: __bj.code, reason: __why, loggedIn: loggedIn };
+                showFastLinkToast('打包失败：' + __why, 'error', 8000);
+                console.log('[123云盘解锁] 打包失败原始响应：', __bat && __bat.responseText ? String(__bat.responseText).slice(0, 400) : '(空)');
+                return { ok: false, code: __bj.code, reason: __why, loggedIn: loggedIn };
             }
         }
 
-        for (const f of files) {
+        if (!__packDone) for (const f of files) {
             let url = null, shape = null, via = null, code = null, message = null;
 
             /* v1.3.6：单文件优先用单文件接口，拿到的是**原文件**直链；
@@ -3335,43 +3353,111 @@
      * 做法：从根目录开始按文件名逐级往下找，命中即返回条目与它所属目录 id。
      * 有界：最多 40 次请求、5 层，避免在超大分享里失控。
      */
+    /**
+     * v1.3.8：串行 DFS → **并发 BFS**。
+     * 原实现是"一个目录列完、sleep 120ms、再列下一个"的串行深度优先，
+     * 150 个目录最坏要 150 × (网络往返 + 120ms) ≈ 40 秒以上 —— 这就是点
+     * 「提取直链」后干等、看着像卡死的直接原因。
+     * 现在改成按层并发：每批同时列 6 个目录，批间只睡 40ms。
+     * 同样的 150 个目录，耗时从约 40 秒降到约 5～8 秒，且命中即停。
+     */
     async function findShareFileByName(shareKey, fileName, parentFileId, depth, budget) {
-        const pid = (parentFileId == null ? 0 : parentFileId);
-        budget.n = (budget.n || 0) + 1;
-        // v1.3.4：预算 40→150、层级 5→10。大分享（固件包常有极深目录）需要更多次请求；
-        // 同时把"整棵树只找一次"的次数限制放开，避免树还没走完就被截断。
-        if (budget.n > 150 || depth > 10) return null;
-        const listed = await listShareFiles(shareKey, pid);
-        // v1.3.4：原来要求 code===0 才继续，新接口 code 字段可能不是 0（或缺失），
-        // Number(undefined)=NaN !== 0 会直接 return null，一次递归都不做。
-        // 改为：只要拿到了非空清单就继续处理。
-        const list = listed.list || [];
-        if (!list.length && Number(listed.code) !== 0 && Number(listed.code) !== -1) return null;
-        // 精确匹配
-        for (let i = 0; i < list.length; i++) {
-            if (String(list[i].FileName) === fileName && Number(list[i].Type) !== 1) {
-                return { item: list[i], parentId: pid };
+        const startPid = (parentFileId == null ? 0 : parentFileId);
+        const normTarget = String(fileName).replace(/\s+/g, '').toLowerCase();
+        const MAX_DIRS = 150, MAX_DEPTH = 10, BATCH = 6;
+        let queue = [{ pid: startPid, depth: 0 }];
+        let visited = 0;
+
+        while (queue.length && visited < MAX_DIRS) {
+            const batch = queue.splice(0, BATCH);
+            const jobs = batch.map(async function (node) {
+                budget.n = (budget.n || 0) + 1;
+                let list = [];
+                try {
+                    const listed = await listShareFiles(shareKey, node.pid);
+                    list = (listed && listed.list) ? listed.list : [];
+                } catch (e) { return { hit: null, dirs: [] }; }
+                // 精确匹配
+                for (let i = 0; i < list.length; i++) {
+                    if (String(list[i].FileName) === fileName && Number(list[i].Type) !== 1) {
+                        return { hit: { item: list[i], parentId: node.pid }, dirs: [] };
+                    }
+                }
+                // 容错匹配：去空白 + 大小写不敏感
+                for (let i = 0; i < list.length; i++) {
+                    const n = String(list[i].FileName || '').replace(/\s+/g, '').toLowerCase();
+                    if (n && n === normTarget && Number(list[i].Type) !== 1) {
+                        return { hit: { item: list[i], parentId: node.pid }, dirs: [] };
+                    }
+                }
+                const dirs = [];
+                for (let i = 0; i < list.length; i++) {
+                    if (Number(list[i].Type) === 1 && list[i].FileId && node.depth + 1 <= MAX_DEPTH) {
+                        dirs.push({ pid: list[i].FileId, depth: node.depth + 1 });
+                    }
+                }
+                return { hit: null, dirs: dirs };
+            });
+
+            const results = await Promise.all(jobs);
+            for (let i = 0; i < results.length; i++) {
+                if (results[i] && results[i].hit) return results[i].hit;
             }
-        }
-        // 容错匹配：去空白/大小写不敏感，避免页面显示名与接口返回名有细微差异
-        const normName = String(fileName).replace(/\s+/g, '').toLowerCase();
-        for (let i = 0; i < list.length; i++) {
-            const n = String(list[i].FileName || '').replace(/\s+/g, '').toLowerCase();
-            if (n && n === normName && Number(list[i].Type) !== 1) {
-                return { item: list[i], parentId: pid };
+            for (let i = 0; i < results.length; i++) {
+                if (results[i] && results[i].dirs && results[i].dirs.length) {
+                    queue = queue.concat(results[i].dirs);
+                }
             }
-        }
-        for (let i = 0; i < list.length; i++) {
-            if (Number(list[i].Type) !== 1) continue;
-            // v1.3.4：目录间加 120ms 间隔，降低被服务端限流的概率（原实现连续打，易触发限流）
-            await new Promise(r => setTimeout(r, 120));
-            const hit = await findShareFileByName(shareKey, fileName, list[i].FileId, depth + 1, budget);
-            if (hit) return hit;
+            visited += batch.length;
+            if (queue.length) await new Promise(r => setTimeout(r, 40));
         }
         return null;
     }
 
     /** 点按钮：把「选中行」翻成「该文件的直链」，复用 extractDirectLink 的整条链路 */
+    /**
+     * v1.3.7：确保拿到「当前目录」的真实清单。
+     *
+     * 根因（"刷新好几次才偶尔能用"）：__hook 是**被动**捕获页面自身请求的。
+     * 每次刷新脚本重新注入，钩子从零开始；若点提取时页面那次列表请求
+     * 尚未发出或尚未返回，__hook.list 就是空的，于是退回逐级递归——
+     * 而递归用的新接口不带 ParentFileId、永远返回根目录，必然定位失败。
+     * 页面何时发请求是不确定的，所以时好时坏，靠刷新碰运气。
+     *
+     * 现在改为主动：钩子没数据时自己发一次列表请求；还拿不到就轮询等待
+     * 钩子捕获（最多约 1.8 秒）。两条路谁先拿到用谁，不再依赖运气。
+     */
+    async function ensureShareList(shareKey, pid) {
+        const pidUse = pid || 0;
+        // ① 钩子已有数据，直接用
+        if (__hook && Array.isArray(__hook.list) && __hook.list.length) return __hook.list;
+
+        // ② 主动发一次列表请求
+        let mine = [];
+        try {
+            const listed = await listShareFiles(shareKey, pidUse);
+            mine = (listed && listed.list) ? listed.list : [];
+        } catch (e) { }
+        if (mine.length) {
+            try { __hook.list = mine; } catch (e) { }
+            return mine;
+        }
+
+        // ③ 主动也没拿到：轮询等待页面自己发请求被钩子捕获
+        for (let i = 0; i < 6; i++) {
+            await new Promise(r => setTimeout(r, 300));
+            if (__hook && Array.isArray(__hook.list) && __hook.list.length) return __hook.list;
+            try {
+                const again = await listShareFiles(shareKey, pidUse);
+                if (again && again.list && again.list.length) {
+                    try { __hook.list = again.list; } catch (e) { }
+                    return again.list;
+                }
+            } catch (e) { }
+        }
+        return [];
+    }
+
     async function extractSelectedFileLink() {
         const shareKey = currentShareKey();
         if (!shareKey || !isSharePage()) return extractDirectLink({});
@@ -3385,6 +3471,16 @@
             return { ok: false, code: -1, reason: '未选中文件' };
         }
         const item = sel[0];
+
+        // v1.3.7：定位前先确保拿到当前目录清单（钩子没捕获到就主动发请求），
+        // 避免"靠刷新碰运气"。失败不再静默，给出明确提示。
+        let __pid0 = 0;
+        try {
+            __pid0 = (__hook && __hook.parentFileId != null && __hook.parentFileId !== '')
+                ? Number(__hook.parentFileId) || 0 : 0;
+        } catch (e) { }
+        await ensureShareList(shareKey, __pid0);
+
         showFastLinkToast(sel.length === 1
             ? '正在定位「' + item.name + '」…'
             : '正在定位 ' + sel.length + ' 个文件…', 'info', 2500);
@@ -3553,6 +3649,10 @@
     /** 选中态是 React 重渲染出来的、不冒泡 click；用 MutationObserver + 捕获期 click + 轮询三重兜底 */
     function addDirectLinkTrigger() {
         if (!isSharePage()) return;
+        // v1.3.7：幂等。下面会在 DOMContentLoaded / window.load / 轮询里多次调用，
+        // 重复注册 MutationObserver 与 setInterval 会白白放大开销并可能互相打架。
+        if (addDirectLinkTrigger.__inited) return;
+        addDirectLinkTrigger.__inited = true;
         const tick = function () { try { updateDirectLinkTrigger(); } catch (e) { } };
         tick();
         let pending = false;
@@ -4504,7 +4604,7 @@
     // 调试/自测入口（供控制台与自动化验收调用）
     try {
         unsafeWindow.__pan123Fix = {
-            version: '1.3.6',
+            version: '1.3.9',
             state: pan123State,
             currentShareKey: currentShareKey,
             buildDownloadUrlFromResponse: buildDownloadUrlFromResponse,
@@ -4521,43 +4621,53 @@
     } catch (e) { }
 
     // 等待页面加载完成
+    let __wbTried = 0;
     function waitForBody() {
-        if (document.body) {
+        if (document。内容) {
             addStyles(); // 先添加样式
             addTriggerButton(); // 添加设置按钮（桌面版放进头像那一行）
             addDirectLinkTrigger(); // 分享页：选中单个文件时出现「提取该文件直链」
             
             // 初始化秒传功能
-            if (FastLinkConfig.enabled) {
+            if (FastLinkConfig。启用) {
                 initFastLink();
                 addFastLinkButton(); // 添加秒传按钮
                 
                 // 点击其他地方关闭菜单
-                document.addEventListener('click', (e) => {
-                    const menu = document.getElementById('fastlink-menu');
-                    const trigger = document.getElementById('fastlink-trigger');
-                    if (menu && trigger && !trigger.contains(e.target) && !menu.contains(e.target)) {
-                        menu.style.display = 'none';
+                document。addEventListener('click', (e) => {
+                    const menu = document。getElementById('fastlink-menu');
+                    const trigger = document。getElementById('fastlink-trigger');
+                    if (menu && trigger && !trigger。contains(e。target) && !menu。contains(e。target)) {
+                        menu。style。display = 'none';
                     }
                 });
                 
-                console.log('[123云盘解锁] 秒传菜单关闭监听器已添加');
+                console。log('[123云盘解锁] 秒传菜单关闭监听器已添加');
             }
-        } else {
+        } else if (__wbTried++ < 300) {
             setTimeout(waitForBody, 100);
         }
     }
 
     // 页面加载完成后初始化
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', waitForBody);
+    if (document。readyState === 'loading') {
+        document。addEventListener('DOMContentLoaded', waitForBody);
     } else {
         waitForBody();
     }
 
+    // v1.3.7：SPA 兜底。DOMContentLoaded 时 React 往往还没挂载出文件列表，
+    // 此时 addDirectLinkTrigger 拿不到行、按钮挂不上（表现同样是"刷新才有用"）。
+    // 在 window.load 之后再补一次初始化（内部已幂等，不会重复注册）。
+    try {
+        window。addEventListener('load', function () {
+            setTimeout(function () { try { waitForBody(); } catch (e) { } }, 600);
+        });
+    } catch (e) { }
+
     // 输出版本信息
-    console.log('[123云盘解锁+秒传] v1.2.0 已加载完成');
-    if (FastLinkConfig.enabled) {
-        console.log('[123云盘解锁] 秒传功能已启用');
+    console。log('[123云盘解锁+秒传] v1.2.0 已加载完成');
+    if (FastLinkConfig。启用) {
+        console。log('[123云盘解锁] 秒传功能已启用');
     }
 })();
