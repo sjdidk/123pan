@@ -52,7 +52,7 @@
 // @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
 // @homepageURL  https://github.com/hawchou1995/123pan_unlock
 // @supportURL   https://qingju.me
-// @version      1.3.6
+// @version      1.3.9
 // @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
