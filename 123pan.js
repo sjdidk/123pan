@@ -52,7 +52,7 @@
 // @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
 // @homepageURL  https://github.com/hawchou1995/123pan_unlock
 // @supportURL   https://qingju.me
-// @version      1.3.9
+// @version      1.3.13
 // @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
@@ -105,6 +105,7 @@
         endpoint: null,      // 页面实际使用的列表端点
         parentFileId: null,  // 页面最近一次列出的目录 id
         list: [],            // 最近一次响应里的文件清单
+        listPid: null,       // v1.3.13：这份 list 属于哪个目录（与 parentFileId 分离）
         seen: 0,
         log: []
     };
@@ -147,7 +148,15 @@
         if (pid != null) __hook.parentFileId = pid;
         var arr = null;
         try { arr = __extractList(JSON.parse(respText || 'null')); } catch (e) { }
-        if (arr && arr.length) __hook.list = arr;
+        // v1.3.13：清单必须和它所属的目录 id 绑定存储。
+        // 原实现只存 list、pid 单独更新，两者会错位 —— 例如先列过根目录 A，
+        // 之后 parentFileId 被更新成子目录 B，但 list 仍是 A 的。
+        // 后续按名字匹配就会在 A 的清单里找 B 的文件，必然落空（正是
+        // 「下载完一个要刷新才能下第二个」的成因：切目录后缓存串了）。
+        if (arr && arr.length) {
+            __hook.list = arr;
+            __hook.listPid = (pid == null || pid === '') ? '0' : String(pid);
+        }
         if (__hook.log.length < 12) {
             __hook.log.push({ url: String(u).slice(0, 160), pid: pid, n: arr ? arr.length : -1 });
         }
@@ -1498,7 +1507,7 @@
 
     /** 服务端状态快照（供控制台诊断与自动化验收读取，不参与任何伪造） */
     const pan123State = {
-        version: '1.3.9',
+        version: '1.3.13',
         shareKey: '',
         loggedIn: null,        // true/false/null(未知)
         visitor: null,         // GET /api/share/visitor/info 原文
@@ -1783,27 +1792,36 @@
 
         const loggedIn = await detectLoginState();
         const __parent = (opts.parentFileId == null ? 0 : opts.parentFileId);
-        const listed = await listShareFiles(shareKey, __parent);
-        // 只认真正的文件：文件夹 Type===1，没有 Etag，送去 batch 必被服务端拒
-        // v1.3.3：只排除「明确是文件夹」。原先还要求 Size > 0，一旦新接口不返回
-        // Size（或字段名不同），整个清单会被滤成空，上层只报「未取到可下载文件」。
-        let files = (listed.list || []).filter(f => Number(f.Type) !== 1);
-        pan123State.rawListLen = (listed.list || []).length;
-        pan123State.filteredLen = files.length;
-        if (!files.length && !opts.onlyName) {
-            const __first = await findFirstShareFile(shareKey, __parent, 0, { n: 0 });
-            if (__first) {
-                files = [__first.item];
-                pan123State.autoDrilled = true;
-            }
-        }
-        // v1.3.6：调用方已定位好条目（多选/单选都走这条），直接用，跳过列表与递归
-        if (opts.fileItems && opts.fileItems.length) {
+
+        /* v1.3.11：调用方已定位好条目（单/多选都走这条）时，**跳过列目录这一整段**。
+         * 原实现不管手上有没有条目，都会先 listShareFiles 发一次网络往返、再按名字
+         * 重新匹配一遍 —— 既多花一次往返，又可能因 parentFileId 与钩子记录的当前
+         * 目录不一致而匹配落空（表现就是单文件"时好时坏、不灵敏"）。
+         */
+        let files = [];
+        let listed = { list: [], code: 0, message: '', status: 0 };
+        const __hasItems = !!(opts.fileItems && opts.fileItems.length);
+        if (__hasItems) {
             files = opts.fileItems.slice();
             pan123State.rawListLen = files.length;
             pan123State.filteredLen = files.length;
+        } else {
+            listed = await listShareFiles(shareKey, __parent);
+            // 只认真正的文件：文件夹 Type===1，没有 Etag，送去 batch 必被服务端拒
+            // v1.3.3：只排除「明确是文件夹」。原先还要求 Size > 0，一旦新接口不返回
+            // Size（或字段名不同），整个清单会被滤成空，上层只报「未取到可下载文件」。
+            files = (listed.list || []).filter(f => Number(f.Type) !== 1);
+            pan123State.rawListLen = (listed.list || []).length;
+            pan123State.filteredLen = files.length;
+            if (!files.length && !opts.onlyName) {
+                const __first = await findFirstShareFile(shareKey, __parent, 0, { n: 0 });
+                if (__first) {
+                    files = [__first.item];
+                    pan123State.autoDrilled = true;
+                }
+            }
         }
-        if (opts.onlyName) {
+        if (opts.onlyName && !__hasItems) {
             const __hit = (listed.list || []).filter(f => String(f.FileName) === String(opts.onlyName));
             if (!__hit.length) {
                 const reason = '当前文件夹里没有找到选中的文件「' + opts.onlyName + '」'
@@ -1897,11 +1915,15 @@
              * 批量接口会把单个文件也打成 zip。原实现先 batch 后单文件，
              * 所以单文件提取拿到的也是压缩包。现在反过来。
              */
-            if (f.Etag && files.length === 1 && !opts.pack) {
+            /* v1.3.12：原实现要求 f.Etag 为真才走单文件接口。但钩子/新接口返回的条目
+             * 常缺 Etag，条件不成立 → 直接落到 batch → 单文件也被打包成 zip。
+             * 现在单文件一律先试原文件接口（Etag 为空也试），失败才退 batch。
+             */
+            if (files.length === 1 && !opts.pack) {
                 const __sg = await gmRequest('POST', origin + '/api/v2/share/download/info',
                     withSharePwd(shareKey, {
                         ShareKey: shareKey, FileID: f.FileId, S3keyFlag: f.S3KeyFlag || '',
-                        Size: f.Size, Etag: f.Etag, OrderId: ''
+                        Size: f.Size, Etag: f.Etag || '', OrderId: ''
                     }));
                 code = __sg.json && __sg.json.code;
                 message = __sg.json && __sg.json.message;
@@ -1948,9 +1970,13 @@
                 }
             }
 
+            const __isPacked = /batch-download|\.zip/i.test(url || '') || via === 'batch_download_share_info';
+            console.log('[123云盘解锁] 取链通道：' + (via || '无') + '，打包=' + __isPacked
+                + '，Etag=' + (f.Etag ? '有' : '无') + '，code=' + code);
             results.push({
                 file: f.FileName, fileId: f.FileId, size: f.Size, etagPresent: !!f.Etag,
-                url: url, shape: shape, via: via, code: code, message: message
+                url: url, shape: shape, via: via, code: code, message: message,
+                packed: __isPacked
             });
 
             if (url && !opts.all) break;
@@ -1967,9 +1993,24 @@
             showFastLinkToast(__tip, first.packed ? 'warning' : 'success', 6000);
             // extractDirectLink 是 async，await 之后手势上下文已丢失，手机端 window.open 多被拦截。
             // 拦下就同页跳转，交给浏览器的下载管理器接管（直链此时已复制到剪贴板）。
+            /* v1.3.13：原实现在 window.open 被拦时执行 location.href = url，
+             * 那是**整页跳转**——页面被下载响应顶掉，后续再点第二个文件就没了
+             * 按钮和脚本状态，只能刷新恢复。这正是"下一个文件要刷新"的直接成因之一。
+             * 现在改用临时 <a target=_blank> 点击：同样触发下载，绝不导航当前页。
+             */
             if (!opts.noOpen) {
-                try { if (!window.open(first.url, '_blank')) location.href = first.url; }
-                catch (e) { location.href = first.url; }
+                try {
+                    const __a = document.createElement('a');
+                    __a.href = first.url;
+                    __a.target = '_blank';
+                    __a.rel = 'noopener noreferrer';
+                    __a.style.display = 'none';
+                    document.body.appendChild(__a);
+                    __a.click();
+                    setTimeout(function () { try { __a.remove(); } catch (e) { } }, 1000);
+                } catch (e) {
+                    try { window.open(first.url, '_blank'); } catch (e2) { }
+                }
             }
             return { ok: true, url: first.url, shape: first.shape, via: first.via, loggedIn: loggedIn, check: check, results: results };
         }
@@ -3428,18 +3469,22 @@
      * 钩子捕获（最多约 1.8 秒）。两条路谁先拿到用谁，不再依赖运气。
      */
     async function ensureShareList(shareKey, pid) {
-        const pidUse = pid || 0;
-        // ① 钩子已有数据，直接用
-        if (__hook && Array.isArray(__hook.list) && __hook.list.length) return __hook.list;
+        const pidUse = String(pid == null ? 0 : pid);
+        // v1.3.13：只有「缓存清单所属的目录」与「当前目录」一致才可复用，
+        // 否则串目录会导致按名字匹配必然落空。
+        if (__hook && Array.isArray(__hook.list) && __hook.list.length
+            && String(__hook.listPid) === pidUse) {
+            return __hook.list;
+        }
 
-        // ② 主动发一次列表请求
+        // 主动发一次列表请求（目录切换后必须重新拉）
         let mine = [];
         try {
-            const listed = await listShareFiles(shareKey, pidUse);
+            const listed = await listShareFiles(shareKey, Number(pidUse) || 0);
             mine = (listed && listed.list) ? listed.list : [];
         } catch (e) { }
         if (mine.length) {
-            try { __hook.list = mine; } catch (e) { }
+            try { __hook.list = mine; __hook.listPid = pidUse; } catch (e) { }
             return mine;
         }
 
@@ -3458,10 +3503,66 @@
         return [];
     }
 
+    /**
+     * v1.3.10：一次遍历定位**多个**文件。
+     *
+     * 根因（打包"不灵敏"）：原多选分支是 for 循环里对每个文件各跑一次
+     * findShareFileByName —— 而后者是**一整棵树的 BFS**。选 5 个文件且它们
+     * 不在当前层时，等于把同一棵树完整遍历 5 遍（每遍最多 150 个目录请求），
+     * 耗时成倍放大，且中途毫无提示，看起来就是"点了没反应"。
+     * 现在改为：只走一遍树，沿途把命中的目标全部收进结果，凑齐即提前返回。
+     */
+    async function findManyShareFiles(shareKey, names, startPid, budget) {
+        const norm = function (n) { return String(n || '').replace(/\s+/g, '').toLowerCase(); };
+        const targets = new Set((names || []).map(norm).filter(Boolean));
+        const found = new Map();
+        if (!targets.size) return found;
+        const MAX_DIRS = 200, MAX_DEPTH = 10, BATCH = 6;
+        let queue = [{ pid: startPid || 0, depth: 0 }];
+        let visited = 0;
+        while (queue.length && visited < MAX_DIRS && found.size < targets.size) {
+            const batch = queue.splice(0, BATCH);
+            const jobs = batch.map(async function (node) {
+                budget.n = (budget.n || 0) + 1;
+                let list = [];
+                try {
+                    const l = await listShareFiles(shareKey, node.pid);
+                    list = (l && l.list) ? l.list : [];
+                } catch (e) { return { dirs: [] }; }
+                const dirs = [];
+                for (let i = 0; i < list.length; i++) {
+                    const it = list[i];
+                    const n = norm(it.FileName || '');
+                    if (Number(it.Type) === 1) {
+                        if (it.FileId && node.depth + 1 <= MAX_DEPTH) {
+                            dirs.push({ pid: it.FileId, depth: node.depth + 1 });
+                        }
+                        continue;
+                    }
+                    if (n && targets.has(n) && !found.has(n)) found.set(n, it);
+                }
+                return { dirs: dirs };
+            });
+            const rs = await Promise.all(jobs);
+            for (let i = 0; i < rs.length; i++) {
+                if (rs[i] && rs[i].dirs && rs[i].dirs.length) queue = queue.concat(rs[i].dirs);
+            }
+            visited += batch.length;
+            if (queue.length && found.size < targets.size) {
+                await new Promise(r => setTimeout(r, 30));
+            }
+        }
+        return found;
+    }
+
     async function extractSelectedFileLink() {
         const shareKey = currentShareKey();
         if (!shareKey || !isSharePage()) return extractDirectLink({});
         const selAll = getShareSelection();
+        console.log('[123云盘解锁] 点击提取：选中 ' + selAll.length + ' 项'
+            + '，钩子目录=' + (__hook.parentFileId == null ? '?' : __hook.parentFileId)
+            + '，缓存清单目录=' + (__hook.listPid == null ? '?' : __hook.listPid)
+            + '，缓存条数=' + ((__hook.list || []).length));
         // v1.3.6：允许勾选多个文件（打包）；文件夹一律排除（直链/打包都不支持）
         const sel = selAll.filter(x => !x.isFolder);
         if (!sel.length) {
@@ -3471,6 +3572,7 @@
             return { ok: false, code: -1, reason: '未选中文件' };
         }
         const item = sel[0];
+        const __t1 = Date.now();
 
         // v1.3.7：定位前先确保拿到当前目录清单（钩子没捕获到就主动发请求），
         // 避免"靠刷新碰运气"。失败不再静默，给出明确提示。
@@ -3489,31 +3591,50 @@
          * 优先从钩子捕获的当前层清单里按名字匹配，匹配不到再逐级查找。
          */
         if (sel.length > 1) {
-            const items = [];
+            const __t0 = Date.now();
             let pid = 0;
             try {
                 pid = (__hook && __hook.parentFileId != null && __hook.parentFileId !== '')
                     ? Number(__hook.parentFileId) || 0 : 0;
             } catch (e) { }
+
+            // ① 先在当前层清单里一次性匹配（最常见，零网络开销）
+            const __norm = function (n) { return String(n || '').replace(/\s+/g, '').toLowerCase(); };
             const src = (__hook && Array.isArray(__hook.list)) ? __hook.list : [];
-            for (const one of sel) {
-                let found = null;
-                const normT = String(one.name).replace(/\s+/g, '').toLowerCase();
-                for (let hi = 0; hi < src.length; hi++) {
-                    const n = String((src[hi].FileName || src[hi].fileName || src[hi].name) || '')
-                        .replace(/\s+/g, '').toLowerCase();
-                    if (n && n === normT) { found = normalizeShareItem(src[hi]); break; }
-                }
-                if (!found) {
-                    const b2 = { n: 0 };
-                    const h2 = await findShareFileByName(shareKey, one.name, pid, 0, b2);
-                    if (h2) found = h2.item;
-                }
-                if (found) items.push(found);
+            const map = new Map();
+            for (let hi = 0; hi < src.length; hi++) {
+                const n = __norm(src[hi].FileName || src[hi].fileName || src[hi].name);
+                if (n && !map.has(n)) map.set(n, normalizeShareItem(src[hi]));
             }
+            const items = [];
+            const missing = [];
+            for (const one of sel) {
+                const hitNow = map.get(__norm(one.name));
+                if (hitNow) items.push(hitNow); else missing.push(one.name);
+            }
+
+            // ② 仍未命中的，一次遍历整棵树全部补齐（不再是每个文件各走一遍）
+            if (missing.length) {
+                showFastLinkToast('已匹配 ' + items.length + '/' + sel.length
+                    + '，正在目录树中查找其余 ' + missing.length + ' 个…', 'info', 30000);
+                const b3 = { n: 0 };
+                const got = await findManyShareFiles(shareKey, missing, pid, b3);
+                for (const one of missing) {
+                    const g = got.get(__norm(one));
+                    if (g) items.push(normalizeShareItem(g));
+                }
+            }
+
+            console.log('[123云盘解锁] 多选定位完成：' + items.length + '/' + sel.length
+                + '，耗时 ' + (Date.now() - __t0) + 'ms');
+
             if (!items.length) {
                 showFastLinkToast('未能定位所选文件，请进入它们所在目录后重试', 'error', 5000);
                 return { ok: false, code: -1, reason: '未定位到所选文件' };
+            }
+            if (items.length < sel.length) {
+                showFastLinkToast('只定位到 ' + items.length + '/' + sel.length
+                    + ' 个，将对已找到的打包', 'warning', 4000);
             }
             pan123State.shareKey = shareKey;
             showFastLinkToast('已定位 ' + items.length + ' 个文件，正在打包…', 'info', 3000);
@@ -3562,7 +3683,11 @@
             return { ok: false, code: -1, reason: reason };
         }
         pan123State.shareKey = shareKey;
-        return extractDirectLink({ parentFileId: hit.parentId, onlyName: item.name });
+        console.log('[123云盘解锁] 单文件定位完成：' + item.name
+            + '，耗时 ' + (Date.now() - __t1) + 'ms');
+        // v1.3.11：已拿到完整条目（FileId/Size/Etag/S3KeyFlag），直接送进提取流程，
+        // 不再回炉重列目录、也不再按名字重匹配（省一次往返、消除目录不一致导致的失败）。
+        return extractDirectLink({ fileItems: [hit.item], parentFileId: hit.parentId, noOpen: false });
     }
 
     /** 分享页浮动按钮：只在「恰好选中 1 个文件」时出现 */
@@ -3576,7 +3701,16 @@
             showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
             return;
         }
-        extractSelectedFileLink().catch(function (err) {
+        // v1.3.13：重入保护。连续点第二个文件时上一次可能还在跑（打包/取链未回），
+        // 两次流程交错会互相覆盖状态，表现就是"点了没反应"。这里串行化并保证解锁。
+        if (onDirectLinkClick.__busy) {
+            showFastLinkToast('上一次提取还在进行，请稍候…', 'warning', 2500);
+            return;
+        }
+        onDirectLinkClick.__busy = true;
+        const __done = function () { onDirectLinkClick.__busy = false; };
+        extractSelectedFileLink().then(__done, function (err) {
+            __done();
             showFastLinkToast('提取失败：' + err, 'error', 5000);
         });
     }
@@ -4604,7 +4738,7 @@
     // 调试/自测入口（供控制台与自动化验收调用）
     try {
         unsafeWindow.__pan123Fix = {
-            version: '1.3.9',
+            version: '1.3.13',
             state: pan123State,
             currentShareKey: currentShareKey,
             buildDownloadUrlFromResponse: buildDownloadUrlFromResponse,
